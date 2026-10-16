@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto';
 import { type Agent, type Turn, isMessageable, isStopped, canTakeUserTurn } from './agent.js';
 import type { TranscriptRead } from './transcript.js';
-import { compose, modelCommand } from './prompts.js';
+import { compose, modelCommand, TBUV_RESOLUTION_SOLO } from './prompts.js';
 import type { Clock } from './clock.js';
 
 export const REPLY_WINDOW_MS = 180_000;
@@ -139,28 +139,33 @@ export class Conversation {
     }
   }
 
-  /** The composer's send: human-typed, clears the draft at once. */
-  send(): Promise<void> {
+  /** The composer's send: human-typed, clears the draft at once. Resolves to whether the message was delivered. */
+  send(): Promise<boolean> {
     const text = this.draft;
-    if (!this.canSend) return Promise.resolve();
+    if (!this.canSend) return Promise.resolve(false);
     this.draft = '';
     return this.deliver(text, { userGenerated: true, sendAsUser: false });
   }
 
   /** "Send as me": restarts the idle background job with the text as a real user turn. */
-  sendAsUser(): Promise<void> {
+  sendAsUser(): Promise<boolean> {
     const text = this.draft;
-    if (!this.canSendAsUser) return Promise.resolve();
+    if (!this.canSendAsUser) return Promise.resolve(false);
     this.draft = '';
     return this.deliver(text, { userGenerated: true, sendAsUser: true });
   }
 
   /** An app-composed instruction (chip buttons, wrap-up, status ask): no human tag, the draft is untouched. */
-  sendInstruction(text: string): Promise<void> {
+  sendInstruction(text: string): Promise<boolean> {
     return this.deliver(text, { userGenerated: false, sendAsUser: false });
   }
 
-  private async deliver(message: string, opts: { userGenerated: boolean; sendAsUser: boolean }): Promise<void> {
+  /** A 1:1 chip has no peer to reconcile with: the solo TB/UV wording. */
+  sendTBUVSolo(): Promise<boolean> {
+    return this.sendInstruction(TBUV_RESOLUTION_SOLO);
+  }
+
+  private async deliver(message: string, opts: { userGenerated: boolean; sendAsUser: boolean }): Promise<boolean> {
     const payload = compose(message, { includePreamble: !this.preambleSent, userGenerated: opts.userGenerated });
     type Route = { kind: 'user-turn'; fn: UserTurnSender } | { kind: 'inbox' } | { kind: 'resume'; fn: Resumer };
     let route: Route;
@@ -171,14 +176,14 @@ export class Conversation {
       this.errorMessage = 'That session has no live inbox, it may have exited. Refresh the agent list.';
       if (opts.userGenerated) this.restoreDraft(message);
       this.changed();
-      return;
+      return false;
     }
     const resumeType = route.kind !== 'inbox';
     if (resumeType) {
       if (this.isResuming) {
         if (opts.userGenerated) this.restoreDraft(message);
         this.changed();
-        return;
+        return false;
       }
       this.isResuming = true;
       this.replacedPid = route.kind === 'user-turn' ? this.agent.pid : undefined;
@@ -190,11 +195,13 @@ export class Conversation {
     this.errorMessage = null;
     this.changed();
     const agent = this.agent;
+    let delivered = false;
     await this.track(
       (async () => {
         try {
           if (route.kind === 'inbox') await this.deps.sendInbox(agent, payload);
           else await route.fn(agent, payload);
+          delivered = true;
           if (resumeType) this.startResumeHold();
           this.preambleSent = true;
           this.startWatch();
@@ -210,6 +217,7 @@ export class Conversation {
         }
       })()
     );
+    return delivered;
   }
 
   /** Never lose typed text: put it back at the front of the draft. */

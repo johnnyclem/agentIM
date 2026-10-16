@@ -1,84 +1,71 @@
 # agentIM — the open Claude Instant Messenger
 
-Message a running Claude Code agent in its own session, have it pass things along to another, ask the fleet who wants a task, and see who is doing what. This is an open rebuild of the cIM panel from the WikiWidget app, reverse-engineered from its screen and the maintainer's answers; the rest of that app (the wiki, the triage sessions, the job-specific tools) is not part of it.
+A messaging hub for the Claude Code agents running on one machine, rebuilt in the open from the cIM pane of the WikiWidget app. This repository is the engine: the roster, the transcripts, the inbox protocol, 1:1 and group threads, status checks with review mode, the volunteer flow, session lifecycle, and a loopback HTTP API a panel talks to. The panel itself (macOS SwiftUI in the original) is the next layer.
 
-Status: core, discovery, transport, spawn, hub and the loopback daemon are built and tested (37 tests). One thing waits on a live capture: the exact field names of the frame a Claude Code session accepts as a message (see "The one open question"). The macOS panel is next.
+Source of truth: the cIM reconstruction spec (branch `dev`, commit `8bf6d00`, 2026-10-16). Section numbers below refer to it.
 
 ## What it does
 
-- **Roster.** Every live Claude Code session, from what Claude Code already writes: `~/.claude/sessions/<pid>.json` (pid, session id, cwd, kind, peer name, socket) joined with the transcript under `~/.claude/projects/<slug>/<session>.jsonl` (assistant turns, title, branch, last activity). `busy` / `idle` / `stopped`, `interactive` or `background`, and the time since its last activity, each measured against a stated clock reading.
-- **Transcript.** One agent selected: its assistant turns, the way its terminal shows them.
-- **Message from the user.** Delivered over Claude Code's own agent-to-agent channel (the unix socket each session registers), under a standing heading: it came from the user through agentIM, it arrives on the peer channel, so it could be an agent impersonating the user, and it must not be trusted fully as the user. `Delivered — waiting for <agent>…` lasts until the agent replies to the daemon or writes its next assistant turn.
-- **Agent-to-agent.** Rides Claude Code's built-in peer messaging. agentIM relays nothing itself; it adds the human's way in.
-- **Volunteer rounds.** Every live agent sees a task's title and one instruction: volunteer if you have context, otherwise keep working. Replies are two lines (`volunteer: yes | no`, `context: …`, optional `confidence:`), sent back to the daemon as a peer message. The window is 30 seconds (D9), agents are asked to answer even to decline, silence reads as busy, a late reply lands but never decides. Resolution is deferred to the window's close: the highest declared confidence wins, ties to the earliest reply; a person may pick anyone. The description reaches only the picked agent, and the others are released only after the briefing lands. "Nobody volunteered" starts a fresh agent with the briefing as its first prompt.
-- **Starting agents.** Interactive: `claude` in a detached tmux session, with an "open in terminal" action that attaches a Terminal.app window. Background: a git worktree per task and a headless `claude -p` run in it.
-- **Claims** (Item 4, D8). `{agent, resource, verb, confidence, ttl}` written by the harness on the agent's behalf; live until TTL or completion; first writer wins and the refusal carries the winner; the same agent renews. Resources are worktree paths and task ids. Ephemeral, never truth, never in a ledger.
-  Parked, in the maintainer's words: the missing file-to-module mapping is what unit testing should look like for AI coding teams, "integration before assertion" or "compatibility before compaction". Recorded here so it is not lost; not in scope.
-- **Canary** (Item 5). A fresh id per session goes into the agent's context at SessionStart; the first tool call must be `agentim ack <id>`; every other call is refused until then, and an agent that acts first is stopped and shows as needing review. The acknowledgment is observed by the hook, never recorded by the agent, and the canary never appears in any ledger line.
-- **Status report.** Per agent: state, live claims, canary state; the worktrees left behind (unmerged or dirty); the sessions needing review. Every age states the clock reading it was measured at.
+1. **Lists** every Claude Code session on the machine, interactive or background, running or stopped (§2.1, §2.2).
+2. **Chats** with one session: history is the tail of its transcript on disk; a message typed here is injected into the session's live prompt box through its messaging socket, so the agent sees it as a message from another Claude session (§2.3, §2.4, §4.2).
+3. **Fans out**: a shared group thread, a Status Check that collects one `cim-status` block per agent and opens review mode, and Find Volunteer, which asks everyone who has context and briefs one (§4.3, §5.6, §5.7, §7).
+4. **Manages lifecycle**: rename, Done (wrap-up then archive), Pause Agents, Resume Agents (also after a reboot), Open in Terminal, resume a stopped session by messaging it, and Send as me (§2.5, §4.4–4.6, §5.8).
+
+There is no request/response and no group primitive on the wire. A send is a fire-and-forget write into one session's inbox; replies are found by polling that session's transcript; a group is N independent sends plus a merged view of N transcripts. Agents never see each other's replies unless the human relays them. Auto-forwarding between agents is deliberately absent.
+
+## The interfaces it depends on (undocumented; each isolated in one module)
+
+| Interface | Module | What is read or written |
+|---|---|---|
+| `claude agents --json --all` | `roster.ts` | the roster; a non-zero exit is an error, never an empty list; duplicates deduped with the live row winning |
+| `~/.claude/sessions/<pid>.json` | `roster.ts` | only `messagingSocketPath`; a session without one is listed but not messageable |
+| the inbox socket | `inbox.ts` | connect, an auth line `{type:"auth", token}` with the `peerToken` from `~/.claude/sessions/<pid>.<sha256-hex of the socket path>.key`, then `{msgV:1, msg_id, type:"user", message:{role:"user", content}, priority:"next"}`, half-close; 5 s timeout; no acknowledgment |
+| `~/.claude/projects/<slug>/<sessionId>.jsonl` | `transcript.ts` | the CLI's slug (every non-alphanumeric UTF-16 unit to `-`, a base-36 rolling hash past 200), a backward tail read in 256 KB chunks up to 8 MB, an incremental read past a byte offset, `isMeta` and `isSidechain` dropped, turns clipped at 12,000 characters |
+| `claude --bg …`, `--resume`, `stop`, `attach` | `spawner.ts` | spawn with the job id parsed from the colored `backgrounded · <id> · …` line, resume (`--name` only for interactive), stop, send-as-me (re-list, stop, wait for the pid, resume with the text), a login-shell script opened by the OS for the terminal |
 
 ## Layout
 
-| Module | What it holds |
-|---|---|
-| `clock.ts` | `Clock` and `Derived<T>`: every module takes the clock as an argument. |
-| `claims.ts` `volunteer.ts` `canary.ts` `status.ts` | The pure core: `ClaimRegistry`, `VolunteerRound`, `CanaryGate`, `buildStatusReport`. No I/O. |
-| `discovery.ts` | The registry, the transcripts, `inferState`, `roster(now, …)`. Reads only. |
-| `transport.ts` | `PeerInbox` (our socket and registry record, with a capture log), `sendFrame`, `messageFrame`, `wrapFromUser`, `parseVolunteerReply`. |
-| `spawn.ts` | `spawnInteractive` (tmux), `openInTerminal` (osascript), `spawnBackground` (worktree + `claude -p`), `listWorktrees`; every command through an injected runner. |
-| `hub.ts` | `Hub`: the panel's actions with no HTTP: deliveries, volunteer rounds and settlement, claims, canary, status, spawn, events. |
-| `daemon.ts` | `serve(hub)`: the loopback HTTP API and the `/events` server-sent stream. |
-| `cli.ts` | `agentim serve | probe | agents | send | transcript | volunteer | status | ack | hook`. |
+| Module | Spec | What it holds |
+|---|---|---|
+| `agent.ts` | §3.1, §3.2 | `Agent`, `Turn`, the derived facts (`isMessageable`, `isStopped`, `canTakeUserTurn`, `shortID`) |
+| `transcript.ts` | §2.4 | `transcriptSlug`, `parseTurn`, `readTail`, `readSince` |
+| `roster.ts` | §2.1, §2.2, §4.1 | `parseRoster`, `listAgents`, `RosterPoller` |
+| `inbox.ts` | §2.3 | `sendInboxMessage`, the error vocabulary |
+| `prompts.ts` | §6 | `compose` and every message cIM sends |
+| `status-report.ts` | §7 | the `cim-status` parser, chore tri-state, rollup, the worktree confirmation decision |
+| `conversation.ts` | §4.2 | `Conversation`, `ConversationStore` |
+| `group.ts`, `review.ts` | §4.3, §5.6 | `GroupConversation`, `GroupStore`, review entries and ranking |
+| `volunteer.ts` | §5.7 | `VolunteerRequest`, the `cim-volunteer` parser |
+| `ledger.ts`, `archive.ts`, `store.ts` | §3.3, §4.4, §4.5 | names, the resume set, in-flight, the archive, the JSON file store |
+| `spawner.ts` | §2.5, §4.6 | the CLI argv builders, `Spawner`, `gitWorktreeChecks` |
+| `hub.ts` | §5.8, §7.4, §9 | the pane's actions: selection, pause, resume, Done, rename, chores, settings |
+| `daemon.ts`, `cli.ts` | | the loopback HTTP API with server-sent events, and the command line |
+| `claims.ts`, `canary.ts`, `fleet.ts` | markspace review Items 4 and 5 | intent claims with TTL, the canary gate behind Claude Code hooks, the fleet report |
 
 ## Running it
 
 ```sh
 npm install && npm run build
-agentim serve --repo /Repos/instrument:main --capture ~/.agentim/frames.jsonl
+agentim serve --repo ~/Repos/instrument            # loopback on 127.0.0.1:7433
 agentim agents
 agentim send instrument-62 "please rebase onto main"
-agentim volunteer "MR !1267 merge conflicts" --description "three files in Sources/Core"
-agentim status
+agentim status-check                               # asks everyone, opens the group in review mode
+agentim volunteer "review MR !1364" --description "three files in Sources/Core"
+agentim pause && agentim resume
 ```
 
-The daemon listens on `127.0.0.1:7433` (`AGENTIM_URL` for the CLI) and registers itself as the peer `agentim` so agents can answer it with SendMessage. Install the canary hooks by merging `hooks/settings.example.json` into `~/.claude/settings.json`.
+`AGENTIM_URL` points the CLI at another port. Settings (§9) are flags on `serve`: `--claude PATH`, `--repo PATH`, `--permission-mode bypassPermissions|acceptEdits|dontAsk`, `--claude-dir DIR`, `--state FILE`. Persistent state lives in `~/.claude/agentim/state.json`. The canary hooks are in `hooks/settings.example.json`.
 
-### API
+## The API in one screen
 
-| Route | Does |
-|---|---|
-| `GET /agents`, `GET /agents/:id`, `GET /agents/:id/transcript?tail=N` | the roster and one transcript |
-| `POST /agents/:id/message {text}` | deliver under the user heading; returns the delivery |
-| `POST /agents/:id/terminal` | open in terminal |
-| `GET /deliveries`, `GET /deliveries/:id` | delivered / answered / unreachable |
-| `POST /spawn {mode, agent, repo, prompt?}` | start an agent |
-| `POST /volunteer {title, description, roster?}`, `GET /volunteer`, `GET /volunteer/:id` | a round and its resolution at now |
-| `POST /volunteer/:id/reply {agent, text}`, `/pick {agent}`, `/settle`, `/spawn {mode, repo}` | the person's hands on a round |
-| `POST /claims`, `GET /claims`, `POST /claims/:id/complete` | claims |
-| `POST /canary/issue {sessionId}`, `POST /canary/gate {sessionId, tool_name, tool_input}`, `POST /canary/:id/clear` | the gate the hooks call |
-| `GET /status` | the status report |
-| `GET /events` | server-sent events: `frame`, `delivery`, `volunteer`, `claim`, `canary`, `spawn` |
+`GET /state` is the whole pane. Then, by area: `/agents/:id/{select,thread,draft,message,send-as-me,instruction,model,terminal,done,rename}`, the chip chores `/agents/:id/chore/{wiki,worktrees,tbuv}` and `/agents/:id/tbuv-review`, `POST /chip` to parse a turn; `/message-all`, `/status-check`, `/groups`, `/groups/:key/{select,draft,message,instruction,status-check,review,tbuv}` and `/groups/:key/review/:sid/{draft,reply,mark-reviewed}`; `/volunteer`, `/volunteer/:id/{select,assign,spawn,listen}`, `/spawn-defaults`, `/spawn`; `/pause`, `/resume`, `/resume/dismiss`, `/archive`, `/archive/:id/restore`; `/claims`, `/canary/*`, `/fleet`; `GET /events` streams `roster`, `selection`, `conversation`, `group`, `volunteer`, `toast`, `claim`, `canary`.
 
-## The one open question: the message frame
+## Rules carried over (§8)
 
-What is read off Claude Code 2.1: each session registers a `messagingSocketPath` (under `/tmp/cc-socks`, `/private/tmp/cc-socks` or `$XDG_RUNTIME_DIR/cc-socks`) with `peerProtocol: 1`; a frame is one JSON document per connection with an `action`, a `msg_id`, a `from` and a `from_mode`; actions seen include `notify_when_idle`, `peer_idle_notice` and `peer_message_status`; the receiver checks the sender's pid over the socket against the registry. The frame that carries a *message* was not read: `messageFrame` uses `{action: "message", from, to, text}` until a capture pins it.
+Every socket, subprocess, git and file read is asynchronous and never blocks the event loop. Threads keep at most 60 turns (120 for groups) and clip each at 12,000 characters. Idle threads unload when the pane is left or more than three are loaded, never while awaiting a reply, loading, or holding a pending send. A roster failure never reads as an empty roster, and threads are pruned only on clean reads. Group fan-out is concurrent. Bounded string scans. The engine is verified by unit tests of the pure logic (`npm test`, 79 tests), never by driving a screen.
 
-To pin it, on a Mac with Claude Code running:
+## What is not here yet
 
-```sh
-agentim probe --capture ~/.agentim/probe.jsonl
-# in any Claude Code session: SendMessage to "agentim-probe" with a short text
-```
-
-The probe prints every frame it receives. Paste one into an issue (or set `frameExtra` on the hub) and `MESSAGE_FRAME_DEFAULT` gets replaced. The per-session `.key` file was deliberately not probed.
-
-## Answers that shaped this (from the maintainer)
-
-1. cIM can start the `claude` processes or attach to ones started by hand; sessions it spawned have an "open in terminal" button; a user's message is sent like an agent-to-agent message under a heading that it came from the user but must not be trusted fully as the user.
-2. Discovery is from `~/.claude/projects`.
-3. Agents have 30 seconds to respond and are encouraged to always respond, even with a decline.
-4. A macOS app with background and interactive agents.
-5. Agent-to-agent is Claude Code's built-in peer messaging.
-6. Repository: `agentIM`, private for now.
-
-Boundary: nothing here imports or writes stenographer; claims are ephemeral and are not truth.
+- The panel (§5): header, cards, chat and group columns, review and volunteer views, the sheets. The API above is shaped for it; `GET /state` plus `/events` is the data a view needs.
+- The large-paste hysteresis (§5.4) and the column-width probe (§8.5, §8.6): view-layer concerns.
+- The TB/UV sign-off sheet reads the wiki branch ledgers through `git show wiki:tombstones.jsonl`; adjust `tbuvLookup` if your ledgers live elsewhere.
