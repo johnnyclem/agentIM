@@ -1,4 +1,4 @@
-# cim — Claude Instant Messenger
+# agentIM — the open Claude Instant Messenger
 
 Message a running Claude Code agent in its own session, and have it pass things along to another. This is an open rebuild of the cIM panel from the WikiWidget app, reverse-engineered from its screen and the maintainer's answers; the rest of that app (the wiki, the triage sessions, the job-specific tools) is not part of it.
 

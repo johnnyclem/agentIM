@@ -1,7 +1,7 @@
 {
-  "name": "cim",
+  "name": "agentim",
   "version": "0.1.0",
-  "description": "Claude Instant Messenger — the coordination core for a fleet of Claude Code agents: claims with TTL, volunteer requests with deferred resolution, a canary gate, and the status report. Rebuilt in the open from the WikiWidget cIM panel.",
+  "description": "agentIM, the open Claude Instant Messenger: the coordination core for a fleet of Claude Code agents: claims with TTL, volunteer requests with deferred resolution, a canary gate, and the status report. Rebuilt in the open from the WikiWidget cIM panel.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
