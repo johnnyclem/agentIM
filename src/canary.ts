@@ -32,7 +32,7 @@ export type GateVerdict =
 
 /** The line the harness writes into the system prompt. The id is the only thing the agent has to echo. */
 export function canaryPromptLine(canary: Canary): string {
-  return `Session canary: ${canary.id}. Your first tool call in this session must be ${ACK_TOOL} with this exact id; every other tool call is refused until then.`;
+  return `Session canary: ${canary.id}. Your first tool call in this session must acknowledge it: run \`agentim ack ${canary.id}\` with Bash (or call the ${ACK_TOOL} tool with this exact id). Every other tool call is refused until then.`;
 }
 
 export class CanaryGate {
