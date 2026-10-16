@@ -80,6 +80,11 @@ export class CanaryGate {
     if (canary) delete canary.violation;
   }
 
+  /** Every canary issued, for the status report. */
+  all(): Canary[] {
+    return [...this.canaries.values()];
+  }
+
   /** Sessions that acted without acknowledging, for the status report. */
   needingReview(): Canary[] {
     return [...this.canaries.values()].filter((c) => c.violation !== undefined);

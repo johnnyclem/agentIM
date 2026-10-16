@@ -3,3 +3,8 @@ export * from './claims.js';
 export * from './volunteer.js';
 export * from './canary.js';
 export * from './status.js';
+export * from './discovery.js';
+export * from './transport.js';
+export * from './spawn.js';
+export * from './hub.js';
+export * from './daemon.js';

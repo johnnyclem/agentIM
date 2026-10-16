@@ -1,12 +1,19 @@
 {
   "name": "agentim",
   "version": "0.1.0",
-  "description": "agentIM, the open Claude Instant Messenger: the coordination core for a fleet of Claude Code agents: claims with TTL, volunteer requests with deferred resolution, a canary gate, and the status report. Rebuilt in the open from the WikiWidget cIM panel.",
+  "description": "agentIM, the open Claude Instant Messenger: a loopback daemon that lists running Claude Code agents, messages them over Claude Code's own peer channel under a user heading, runs volunteer rounds, holds claims and a canary gate, and starts interactive or background agents. Rebuilt in the open from the WikiWidget cIM panel.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
@@ -18,6 +25,11 @@
     "typescript": "^5.3.0",
     "vitest": "^4.1.10"
   },
-  "engines": { "node": ">=22" },
-  "license": "MIT"
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "bin": {
+    "agentim": "./dist/cli.js"
+  }
 }

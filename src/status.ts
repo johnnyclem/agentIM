@@ -8,7 +8,8 @@ import type { Claim } from './claims.js';
 import type { Canary } from './canary.js';
 
 export type AgentMode = 'interactive' | 'background';
-export type AgentState = 'busy' | 'idle' | 'stopped';
+export type { AgentState } from './discovery.js';
+import type { AgentState } from './discovery.js';
 
 export interface AgentFact {
   name: string;
