@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import fc from 'fast-check';
 import { ACK_TOOL, CanaryGate, canaryPromptLine } from '../src/canary.js';
-import { buildStatusReport } from '../src/status.js';
+import { buildFleetReport } from '../src/fleet.js';
 
 const T0 = Date.parse('2026-10-16T12:00:00.000Z');
 
@@ -21,7 +21,7 @@ describe('the canary (Item 5)', () => {
     expect(gate.gate('instrument-66', { tool: 'Bash', args: { command: 'rm -rf /' } }, T0 + 1)).toMatchObject({ allow: false, reason: 'unacknowledged', needsReview: true });
     // Stopped: a late acknowledgment does not reopen it
     expect(gate.gate('instrument-66', { tool: ACK_TOOL, args: { canary: 'c-123' } }, T0 + 2)).toMatchObject({ allow: false, reason: 'stopped' });
-    const report = buildStatusReport({ agents: [{ name: 'instrument-66', mode: 'interactive', cwd: '/Repos/instrument', lastActivityAt: T0 + 1 }], worktrees: [], claims: [], canaries: gate.needingReview() }, T0 + 3);
+    const report = buildFleetReport({ agents: [{ name: 'instrument-66', mode: 'interactive', cwd: '/Repos/instrument', lastActivityAt: T0 + 1 }], worktrees: [], claims: [], canaries: gate.needingReview() }, T0 + 3);
     expect(report.needsReview).toEqual([{ sessionId: 'instrument-66', tool: 'Bash', at: T0 + 1 }]);
     expect(report.agents[0].canary).toBe('needs-review');
     // A person clears it; the session still has to acknowledge before it acts

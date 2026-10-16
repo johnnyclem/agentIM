@@ -1,15 +1,16 @@
 /**
- * The status report: what every agent is doing, what it holds, and what is
- * left behind. Pure: facts in, a report out, every age stated against the
- * clock reading it was measured at.
+ * The fleet report (markspace review, Items 4 and 5): what every agent
+ * holds (live claims), its canary state, and the worktrees left behind.
+ * Distinct from the cIM status reply in status-report.ts, which is what an
+ * agent says about itself. Pure: facts in, a report out, every age stated
+ * against the clock reading it was measured at.
  */
 
 import type { Claim } from './claims.js';
 import type { Canary } from './canary.js';
 
 export type AgentMode = 'interactive' | 'background';
-export type { AgentState } from './discovery.js';
-import type { AgentState } from './discovery.js';
+export type AgentState = 'busy' | 'idle' | 'stopped';
 
 export interface AgentFact {
   name: string;
@@ -32,7 +33,7 @@ export interface WorktreeFact {
   agent?: string;
 }
 
-export interface StatusReportInput {
+export interface FleetReportInput {
   agents: AgentFact[];
   worktrees: WorktreeFact[];
   claims: Claim[];
@@ -41,7 +42,7 @@ export interface StatusReportInput {
   idleAfterMs?: number;
 }
 
-export interface AgentStatus {
+export interface FleetAgentStatus {
   name: string;
   mode: AgentMode;
   state: AgentState;
@@ -52,10 +53,10 @@ export interface AgentStatus {
   canary: 'acknowledged' | 'pending' | 'needs-review' | 'none';
 }
 
-export interface StatusReport {
+export interface FleetReport {
   /** The clock reading every age here was measured against. */
   asOf: number;
-  agents: AgentStatus[];
+  agents: FleetAgentStatus[];
   /** Worktrees that are unmerged or uncleaned: the closest thing to a resource registry before claims. */
   leftBehind: WorktreeFact[];
   needsReview: Array<{ sessionId: string; tool: string; at: number }>;
@@ -63,12 +64,12 @@ export interface StatusReport {
 
 export const DEFAULT_IDLE_AFTER_MS = 5 * 60 * 1000;
 
-export function buildStatusReport(input: StatusReportInput, now: number): StatusReport {
+export function buildFleetReport(input: FleetReportInput, now: number): FleetReport {
   const idleAfter = input.idleAfterMs ?? DEFAULT_IDLE_AFTER_MS;
   const claimsByAgent = new Map<string, Claim[]>();
   for (const c of input.claims) claimsByAgent.set(c.agent, [...(claimsByAgent.get(c.agent) ?? []), c]);
   const canaryByAgent = new Map(input.canaries.map((c) => [c.sessionId, c]));
-  const agents = input.agents.map((a): AgentStatus => {
+  const agents = input.agents.map((a): FleetAgentStatus => {
     const since = a.lastActivityAt === null ? null : Math.max(0, now - a.lastActivityAt);
     const state: AgentState = a.stopped || since === null ? 'stopped' : since >= idleAfter ? 'idle' : 'busy';
     const canary = canaryByAgent.get(a.name);
