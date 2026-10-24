@@ -1,160 +1,180 @@
 /**
- * The hub — everything the panel does, with no HTTP in it.
- *
- * It owns the coordination core (claims, volunteer rounds, the canary gate),
- * reads the roster off disk, speaks the peer channel through a `PeerInbox`,
- * and starts agents through an injected runner. Every method takes or
- * records the clock reading it acted at, so a test drives it with a fake
- * clock, fake sockets and a fake runner, and the HTTP layer in `daemon.ts`
- * is a thin translation.
+ * The hub: everything the cIM pane does, with no UI in it (spec §4, §5.8,
+ * §7.4, §9). It owns one instance each of the roster poller, the
+ * conversation store, the group store, the volunteer requests, the archive
+ * and the ledger, plus the harness extras from the markspace review
+ * (claims, the canary gate). The HTTP layer in daemon.ts is a thin
+ * translation; every collaborator is injectable so tests drive the hub
+ * with a fake clock and no sockets.
  */
 
-import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { ClaimRegistry, type Claim, type ClaimInput, type Verdict } from './claims.js';
-import { VolunteerRound, VOLUNTEER_WINDOW_MS, type Resolution, type VolunteerReply, type VolunteerRequest } from './volunteer.js';
-import { CanaryGate, ACK_TOOL, canaryPromptLine, type Canary, type GateVerdict } from './canary.js';
-import { buildStatusReport, type StatusReport, type WorktreeFact } from './status.js';
-import { roster, readTranscript, CLAUDE_DIR, IDLE_AFTER_MS, type Agent, type Roster, type TranscriptSummary } from './discovery.js';
-import { PeerInbox, sendFrame, messageFrame, wrapFromUser, parseVolunteerReply, type Frame, type CapturedFrame } from './transport.js';
-import { runCommand, spawnBackground, spawnInteractive, openInTerminal, listWorktrees, type Runner } from './spawn.js';
+import { userInfo } from 'node:os';
+import { join } from 'node:path';
+import { type Agent, isMessageable, isStopped, shortID, projectName } from './agent.js';
+import { CLAUDE_DIR, readTail, readSince, transcriptPath, type TranscriptRead } from './transcript.js';
+import { runCommand, failureText, type Runner } from './runner.js';
+import { listAgents, RosterPoller } from './roster.js';
+import { sendInboxMessage, NO_INBOX_MESSAGE } from './inbox.js';
+import { Conversation, ConversationStore } from './conversation.js';
+import { GroupConversation, GroupStore, groupKey } from './group.js';
+import { computeReviewEntries, nextUnreviewed, repairSelection, reviewHeader, type ReviewEntry } from './review.js';
+import { VolunteerRequest } from './volunteer.js';
+import { SessionLedger } from './ledger.js';
+import { Archive } from './archive.js';
+import { JsonFileKV, KEYS, type KV } from './store.js';
+import { Spawner, resolveClaude, processAlive, gitWorktreeChecks, terminalTooltip, type PermissionMode } from './spawner.js';
+import { WRAP_UP, pauseMessage, resumeMessage, renameNotice, JOURNAL_NOW, JOURNAL_INCOMPLETE, CLEANUP_SAFE, CLEANUP_ANYWAY, tbuvReviewed } from './prompts.js';
+import { parseStatusReport, choreStates, rollup, worktreeDecision, type StatusReport, type WorktreeFinding, type ChoreState } from './status-report.js';
+import { ClaimRegistry, type ClaimInput, type Verdict } from './claims.js';
+import { CanaryGate, ACK_TOOL, canaryPromptLine, type GateVerdict } from './canary.js';
+import { buildFleetReport, type FleetReport } from './fleet.js';
 import type { Clock } from './clock.js';
 
-export interface HubOptions {
-  /** Where Claude Code keeps its state; `~/.claude` by default. */
-  claudeDir?: string;
-  /** Where the peer sockets live; `/tmp/cc-socks` by default. */
-  socketDir?: string;
-  /** The peer name this daemon registers under: what agents address their replies to. */
-  name?: string;
-  cwd?: string;
-  pid?: number;
-  clock?: Clock;
-  alive?: (pid: number) => boolean;
-  run?: Runner;
-  /** Where background agents get their worktrees. */
-  worktreesDir?: string;
-  /** Repositories whose worktrees the status report inspects, with their base branch. */
-  repos?: Array<{ path: string; baseBranch?: string }>;
-  idleAfterMs?: number;
-  /** Every frame received is appended here as JSON, one per line. */
-  captureLog?: string;
-  /** Overrides on the message frame once a capture pins the real shape. */
-  frameExtra?: Record<string, unknown>;
-  sendTimeoutMs?: number;
-}
-
-export type DeliveryStatus = 'delivered' | 'answered' | 'unreachable';
-
-export interface Delivery {
+export interface ModelPreset {
   id: string;
-  agent: string;
-  text: string;
-  sentAt: number;
-  status: DeliveryStatus;
-  error?: string;
-  answeredAt?: number;
-  reply?: string;
-  /** The delivery replies on this volunteer round, when it is one. */
-  round?: string;
+  label: string;
 }
 
-export interface VolunteerView {
-  request: VolunteerRequest;
-  resolution: Resolution;
-  replies: VolunteerReply[];
-  briefed: boolean;
-  spawned: { mode: 'interactive' | 'background'; agent: string; where: string } | null;
+/** The Settings the panel reads (§9). */
+export interface Settings {
+  claudePath: string | null;
+  repoPath: string | null;
+  permissionMode: PermissionMode;
+  planningModel: string;
+  modelPresets: ModelPreset[];
+  claudeDir: string;
+  statePath: string;
+}
+
+export const DEFAULT_SETTINGS: Settings = {
+  claudePath: null,
+  repoPath: null,
+  permissionMode: 'acceptEdits',
+  planningModel: 'claude-opus-5-5',
+  modelPresets: [
+    { id: 'claude-fable-5-1', label: 'Fable 5.1 (smartest)' },
+    { id: 'claude-opus-5-5', label: 'Opus 5.5 (workhorse)' },
+    { id: 'claude-haiku-5-5', label: 'Haiku 5.5 (fastest)' },
+  ],
+  claudeDir: CLAUDE_DIR,
+  statePath: join(CLAUDE_DIR, 'agentim', 'state.json'),
+};
+
+export interface HubDeps {
+  settings?: Partial<Settings>;
+  kv?: KV;
+  clock?: Clock;
+  sleep?: (ms: number) => Promise<void>;
+  run?: Runner;
+  alive?: (pid: number) => boolean;
+  listAgents?: () => Promise<Agent[]>;
+  sendInbox?: (agent: Agent, text: string) => Promise<void>;
+  readTail?: (path: string) => Promise<TranscriptRead>;
+  readSince?: (path: string, offset: number) => Promise<TranscriptRead>;
+  gitChecks?: (cwd: string) => Promise<WorktreeFinding>;
+  writeScript?: (content: string) => Promise<string>;
+  openFile?: (path: string) => Promise<void>;
+  osUserName?: string;
+}
+
+export type Selection = { kind: 'agent'; sessionID: string } | { kind: 'group'; key: string } | { kind: 'volunteer'; id: string } | null;
+
+export interface Toast {
+  id: string;
+  at: number;
+  text: string;
+  /** Text the UI should put on the clipboard (the rename flow). */
+  clipboard?: string;
 }
 
 export type HubEvent =
-  | { type: 'frame'; at: number; captured: CapturedFrame }
-  | { type: 'delivery'; at: number; delivery: Delivery }
-  | { type: 'volunteer'; at: number; view: VolunteerView }
-  | { type: 'claim'; at: number; verdict: Verdict }
-  | { type: 'canary'; at: number; sessionId: string; verdict: GateVerdict | 'issued' | 'cleared' }
-  | { type: 'spawn'; at: number; mode: 'interactive' | 'background'; agent: string; where: string };
+  | { type: 'roster' }
+  | { type: 'conversation'; sessionID: string }
+  | { type: 'group'; key: string }
+  | { type: 'volunteer'; id: string }
+  | { type: 'selection'; selection: Selection }
+  | { type: 'toast'; toast: Toast }
+  | { type: 'claim'; verdict: Verdict }
+  | { type: 'canary'; sessionID: string; verdict: GateVerdict | 'issued' | 'cleared' };
 
-export const DEFAULT_SOCKET_DIR = '/tmp/cc-socks';
-export const DEFAULT_PEER_NAME = 'agentim';
-
-/** The text of an inbound frame, whatever field the sender used; null when there is none. */
-export function frameText(frame: Frame): string | null {
-  for (const key of ['text', 'content', 'message', 'body', 'summary']) {
-    const v = frame[key];
-    if (typeof v === 'string' && v.trim()) return v;
-    if (v && typeof v === 'object' && typeof (v as { text?: unknown }).text === 'string') return (v as { text: string }).text;
-  }
-  return null;
+export interface ChoreOutcome {
+  action: 'sent' | 'open-wiki-entry' | 'needs-confirmation' | 'sign-off' | 'nothing';
+  text?: string;
+  /** open-wiki-entry: the path and the directories to search, the reporting agent's cwd first. */
+  path?: string;
+  searchDirs?: string[];
+  /** needs-confirmation: the alert's reasons. */
+  reasons?: string[];
+  /** sign-off: the de-duplicated TB/UV ids with their ledger records. */
+  records?: TbUvRecord[];
 }
 
-export function volunteerAsk(request: VolunteerRequest, replyTo: string): string {
-  return [
-    `[agentIM volunteer request ${request.id}] New task: "${request.title}".`,
-    `If you already have context on this, volunteer; otherwise keep doing what you were doing. Nobody sees the description until picked.`,
-    `Reply to ${replyTo} within ${Math.round(request.windowMs / 1000)} seconds, even to decline, with these lines:`,
-    `request: ${request.id}`,
-    `volunteer: yes | no`,
-    `context: <one line on why>`,
-    `confidence: <0.0-1.0, volunteers only>`,
-  ].join('\n');
+export interface TbUvRecord {
+  id: string;
+  kind: 'tombstone' | 'unverified' | 'not-found';
+  date?: string;
+  claim?: string;
+  supersededBy?: string;
+  doubt?: string;
 }
 
-export function briefingText(request: VolunteerRequest): string {
-  return `[agentIM volunteer request ${request.id}] You were picked for "${request.title}". The briefing follows.\n\n${request.description}`;
-}
-
-export function releaseText(request: VolunteerRequest, winner: string): string {
-  return `[agentIM volunteer request ${request.id}] "${request.title}" is taken by ${winner}. Nothing to do; carry on.`;
-}
-
-/** A tool call as a Claude Code hook reports it, mapped onto the gate's view: `agentim ack <id>` from Bash, or an MCP tool named cim_ack, is the acknowledgment. */
-export function toolCallOf(input: { tool_name?: string; tool_input?: Record<string, unknown> }): { tool: string; args?: Record<string, unknown> } {
-  const tool = input.tool_name ?? '';
-  const args = input.tool_input ?? {};
-  if (tool === 'Bash' && typeof args.command === 'string') {
-    const m = /^\s*(?:npx\s+)?agentim\s+ack\s+(\S+)\s*$/.exec(args.command);
-    if (m) return { tool: ACK_TOOL, args: { canary: m[1] } };
-  }
-  if (tool === ACK_TOOL || tool.endsWith(`__${ACK_TOOL}`)) return { tool: ACK_TOOL, args };
-  return { tool, args };
-}
+const sleepReal = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class Hub {
+  readonly settings: Settings;
+  readonly kv: KV;
+  readonly clock: Clock;
+  readonly roster: RosterPoller;
+  readonly conversations: ConversationStore;
+  readonly groups: GroupStore;
+  readonly ledger: SessionLedger;
+  readonly archive: Archive;
+  readonly spawner: Spawner;
+  readonly volunteers = new Map<string, VolunteerRequest>();
   readonly claims = new ClaimRegistry();
   readonly canaries = new CanaryGate();
-  readonly inbox: PeerInbox;
-  private rounds = new Map<string, { round: VolunteerRound; spawned: VolunteerView['spawned'] }>();
-  private deliveries = new Map<string, Delivery>();
+  selection: Selection = null;
+  isPausing = false;
+  isResuming = false;
+  donePending = new Set<string>();
+  toasts: Toast[] = [];
   private listeners = new Set<(e: HubEvent) => void>();
-  readonly clock: Clock;
-  readonly claudeDir: string;
-  readonly name: string;
+  private pollCtrl: AbortController | null = null;
   private readonly run: Runner;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sendInboxFn: (agent: Agent, text: string) => Promise<void>;
+  private readonly gitChecks: (cwd: string) => Promise<WorktreeFinding>;
+  private readonly osUserName: string;
 
-  constructor(readonly opts: HubOptions = {}) {
-    this.clock = opts.clock ?? Date.now;
-    this.claudeDir = opts.claudeDir ?? CLAUDE_DIR;
-    this.name = opts.name ?? DEFAULT_PEER_NAME;
-    this.run = opts.run ?? runCommand;
-    this.inbox = new PeerInbox({
-      claudeDir: this.claudeDir,
-      socketDir: opts.socketDir ?? DEFAULT_SOCKET_DIR,
-      name: this.name,
-      cwd: opts.cwd ?? process.cwd(),
-      pid: opts.pid,
-      captureLog: opts.captureLog,
-      onFrame: (frame, captured) => this.onFrame(frame, captured),
-    });
+  constructor(deps: HubDeps = {}) {
+    this.settings = { ...DEFAULT_SETTINGS, ...deps.settings };
+    this.kv = deps.kv ?? new JsonFileKV(this.settings.statePath);
+    this.clock = deps.clock ?? Date.now;
+    this.sleep = deps.sleep ?? sleepReal;
+    this.run = deps.run ?? runCommand;
+    this.osUserName = deps.osUserName ?? safeUserName();
+    const sessionsDir = join(this.settings.claudeDir, 'sessions');
+    const claudeBin = () => resolveClaude(this.settings.claudePath);
+    const list = deps.listAgents ?? (() => listAgents({ run: this.run, claudeBin: claudeBin() ?? 'claude', sessionsDir, clock: this.clock }));
+    this.sendInboxFn = deps.sendInbox ?? ((agent, text) => sendInboxMessage({ socketPath: agent.inboxSocketPath, pid: agent.pid }, text, { sessionsDir }));
+    this.gitChecks = deps.gitChecks ?? ((cwd) => gitWorktreeChecks(cwd, this.run));
+    const tail = deps.readTail ?? ((p: string) => readTail(p));
+    const since = deps.readSince ?? ((p: string, o: number) => readSince(p, o));
+    const path = (a: Agent) => transcriptPath(a.cwd, a.sessionID, this.settings.claudeDir);
+
+    this.roster = new RosterPoller({ list, resolveCli: claudeBin, sleep: this.sleep });
+    this.ledger = new SessionLedger(this.kv, this.clock);
+    this.archive = new Archive(this.kv, this.clock);
+    this.spawner = new Spawner({ run: this.run, claudeBin, clock: this.clock, sleep: this.sleep, alive: deps.alive ?? processAlive, listAgents: list, writeScript: deps.writeScript, openFile: deps.openFile });
+    this.conversations = new ConversationStore({ clock: this.clock, sleep: this.sleep, readTail: tail, readSince: since, sendInbox: this.sendInboxFn, transcriptPath: path, onChange: (c) => this.emit({ type: 'conversation', sessionID: c.sessionID }) });
+    this.conversations.resumer = (agent, prompt) => this.spawner.resume(agent, prompt);
+    this.conversations.userTurnSender = (agent, prompt) => this.spawner.sendAsUserTurn(agent, prompt);
+    this.groups = new GroupStore({ clock: this.clock, sleep: this.sleep, readTail: tail, readSince: since, sendInbox: this.sendInboxFn, transcriptPath: path, onChange: (g) => this.emit({ type: 'group', key: g.key }) });
+    this.roster.onClean((agents) => this.onCleanRoster(agents));
   }
 
-  async start(): Promise<void> {
-    await this.inbox.start(this.clock());
-  }
-
-  async stop(): Promise<void> {
-    await this.inbox.stop();
-  }
+  // ---- lifecycle and events -------------------------------------------------
 
   subscribe(fn: (e: HubEvent) => void): () => void {
     this.listeners.add(fn);
@@ -165,296 +185,609 @@ export class Hub {
     for (const fn of this.listeners) fn(e);
   }
 
-  // ---- roster ------------------------------------------------------------
-
-  agents(): Roster {
-    return roster(this.clock(), { claudeDir: this.claudeDir, alive: this.opts.alive, idleAfterMs: this.opts.idleAfterMs ?? IDLE_AFTER_MS, selfPid: this.opts.pid ?? process.pid });
+  toast(text: string, clipboard?: string): Toast {
+    const toast: Toast = { id: randomUUID(), at: this.clock(), text, ...(clipboard ? { clipboard } : {}) };
+    this.toasts = [...this.toasts.slice(-49), toast];
+    this.emit({ type: 'toast', toast });
+    return toast;
   }
 
-  /** An agent by peer name or session id. */
-  agent(id: string): Agent | null {
-    return this.agents().agents.find((a) => a.name === id || a.sessionId === id) ?? null;
+  /** Start polling the roster every 5 seconds until `stop`. */
+  start(intervalMs?: number): void {
+    if (this.pollCtrl) return;
+    this.pollCtrl = new AbortController();
+    void this.roster.poll(this.pollCtrl.signal, intervalMs);
   }
 
-  transcript(id: string, tail = 50): TranscriptSummary | null {
-    const a = this.agent(id);
-    return a?.transcriptPath ? readTranscript(a.transcriptPath, { tail }) : null;
+  /** Leaving the pane: stop polling and unload every idle thread. */
+  stop(): void {
+    this.pollCtrl?.abort();
+    this.pollCtrl = null;
+    this.conversations.unloadAllIdle();
+    this.groups.unloadAllIdle();
+    for (const v of this.volunteers.values()) v.close();
   }
 
-  // ---- messages ----------------------------------------------------------
+  refresh(): Promise<void> {
+    return this.roster.refresh();
+  }
 
-  /**
-   * Deliver a human's message to an agent over the peer channel, under the
-   * user heading. `Delivered — waiting for <agent>…` lasts until the agent
-   * replies to this daemon or writes its next assistant turn.
-   */
-  async send(agentId: string, text: string, opts: { fromUser?: boolean; round?: string } = {}): Promise<Delivery> {
-    const now = this.clock();
-    const target = this.agent(agentId);
-    if (!target) throw new Error(`no agent named ${agentId}`);
-    const body = opts.fromUser === false ? text : wrapFromUser(text);
-    const delivery: Delivery = { id: randomUUID(), agent: target.name, text, sentAt: now, status: 'delivered', ...(opts.round ? { round: opts.round } : {}) };
-    if (!target.socket || !existsSync(target.socket) || target.state === 'stopped') {
-      delivery.status = 'unreachable';
-      delivery.error = target.state === 'stopped' ? 'the agent has stopped' : 'the agent has no peer socket';
-    } else {
-      try {
-        await sendFrame(target.socket, messageFrame({ from: this.name, to: target.name, text: body }, this.opts.frameExtra), { timeoutMs: this.opts.sendTimeoutMs });
-      } catch (err) {
-        delivery.status = 'unreachable';
-        delivery.error = err instanceof Error ? err.message : String(err);
+  // ---- the roster as the pane sees it ---------------------------------------
+
+  /** Archive-filtered, ledger-decorated. */
+  get visibleAgents(): Agent[] {
+    return this.archive.visible(this.ledger.decorate(this.roster.agents));
+  }
+  get liveCount(): number {
+    return this.visibleAgents.filter((a) => !isStopped(a)).length;
+  }
+  get messageableAgents(): Agent[] {
+    return this.visibleAgents.filter(isMessageable);
+  }
+
+  agent(sessionID: string): Agent | null {
+    return this.visibleAgents.find((a) => a.sessionID === sessionID) ?? null;
+  }
+
+  private requireAgent(sessionID: string): Agent {
+    const a = this.agent(sessionID);
+    if (!a) throw new Error(`No agent with session ${sessionID} is listed.`);
+    return a;
+  }
+
+  /** After each clean roster read: observe, prune, refresh memberships, repair the selection. */
+  private onCleanRoster(_agents: Agent[]): void {
+    const visible = this.visibleAgents;
+    this.ledger.observe(visible);
+    const decorated = this.visibleAgents; // stand-ins may have changed after observe
+    this.conversations.prune(decorated);
+    this.groups.refreshMembership(decorated);
+    for (const v of this.volunteers.values()) v.refreshRecipients(decorated);
+    if (this.selection?.kind === 'agent' && !decorated.some((a) => a.sessionID === (this.selection as { sessionID: string }).sessionID)) this.setSelection(null);
+    this.emit({ type: 'roster' });
+  }
+
+  // ---- selection ------------------------------------------------------------
+
+  setSelection(selection: Selection): void {
+    this.selection = selection;
+    this.emit({ type: 'selection', selection });
+  }
+
+  /** Select a card: create the thread if new, load its tail, unload stale ones. */
+  async selectAgent(sessionID: string): Promise<Conversation> {
+    const agent = this.requireAgent(sessionID);
+    const c = this.conversations.select(agent);
+    this.setSelection({ kind: 'agent', sessionID });
+    await c.loadIfNeeded();
+    return c;
+  }
+
+  async selectGroup(key: string): Promise<GroupConversation> {
+    const g = this.groups.existing(key);
+    if (!g) throw new Error(`No group ${key}.`);
+    this.setSelection({ kind: 'group', key });
+    await g.loadIfNeeded();
+    return g;
+  }
+
+  selectVolunteer(id: string): VolunteerRequest {
+    const v = this.volunteers.get(id);
+    if (!v) throw new Error(`No volunteer request ${id}.`);
+    this.setSelection({ kind: 'volunteer', id });
+    return v;
+  }
+
+  // ---- 1:1 ----------------------------------------------------------------------
+
+  conversation(sessionID: string): Conversation {
+    return this.conversations.conversation(this.requireAgent(sessionID));
+  }
+
+  /** Type into the composer and send. */
+  async send(sessionID: string, text: string): Promise<boolean> {
+    const c = this.conversation(sessionID);
+    c.draft = text;
+    return c.send();
+  }
+
+  async sendAsUser(sessionID: string, text: string): Promise<boolean> {
+    const c = this.conversation(sessionID);
+    c.draft = text;
+    return c.sendAsUser();
+  }
+
+  async changeModel(sessionID: string, modelId: string): Promise<boolean> {
+    const c = this.conversation(sessionID);
+    const ok = await c.changeModel(modelId);
+    if (ok) this.toast(`Asked ${c.agent.name} to switch to ${this.settings.modelPresets.find((m) => m.id === modelId)?.label ?? modelId}`);
+    return ok;
+  }
+
+  async openInTerminal(sessionID: string): Promise<{ opened: boolean; tooltip: string }> {
+    const agent = this.requireAgent(sessionID);
+    return { opened: await this.spawner.openInTerminal(agent), tooltip: terminalTooltip(agent) };
+  }
+
+  // ---- groups -------------------------------------------------------------------
+
+  /** Message All: a group of every messageable agent, a live snapshot. */
+  async messageAll(): Promise<GroupConversation> {
+    const agents = this.messageableAgents;
+    if (agents.length < 2) throw new Error('Message All needs at least two messageable agents; message the one directly.');
+    const g = this.groups.group(agents);
+    await this.selectGroup(g.key);
+    return g;
+  }
+
+  async newGroup(sessionIDs: string[]): Promise<GroupConversation> {
+    const agents = sessionIDs.map((id) => this.requireAgent(id)).filter(isMessageable);
+    if (agents.length < 2) throw new Error('A group needs at least two messageable agents.');
+    const g = this.groups.group(agents);
+    await this.selectGroup(g.key);
+    return g;
+  }
+
+  /** Status Check: open (or reuse) the group, send the ask, open it in review mode. */
+  async statusCheck(sessionIDs?: string[]): Promise<GroupConversation> {
+    const agents = (sessionIDs ? sessionIDs.map((id) => this.requireAgent(id)) : this.messageableAgents).filter(isMessageable);
+    if (agents.length === 0) throw new Error('Nobody to check: no agent has a live inbox.');
+    let g: GroupConversation;
+    if (agents.length === 1) {
+      // One recipient: a solo check still goes through a group so review mode and the rollup apply.
+      const partner = this.messageableAgents.find((a) => a.sessionID !== agents[0].sessionID);
+      if (!partner) {
+        const c = this.conversation(agents[0].sessionID);
+        await c.sendInstruction((await import('./prompts.js')).STATUS_CHECK);
+        throw new Error('Only one agent is messageable; the status ask went to its 1:1 thread.');
       }
+      g = this.groups.group([agents[0], partner]);
+      await g.sendInstruction((await import('./prompts.js')).STATUS_CHECK, agents[0]);
+    } else {
+      g = this.groups.group(agents);
+      await g.sendStatusCheck();
     }
-    this.deliveries.set(delivery.id, delivery);
-    this.emit({ type: 'delivery', at: now, delivery });
-    return delivery;
+    g.isReviewing = true;
+    await this.selectGroup(g.key);
+    this.emit({ type: 'group', key: g.key });
+    return g;
   }
 
-  delivery(id: string): Delivery | null {
-    return this.deliveries.get(id) ?? null;
+  group(key: string): GroupConversation {
+    const g = this.groups.existing(key);
+    if (!g) throw new Error(`No group ${key}.`);
+    return g;
   }
 
-  /** Every delivery, newest first, after checking the transcripts for answers. */
-  deliveriesList(): Delivery[] {
-    this.refreshDeliveries();
-    return [...this.deliveries.values()].sort((a, b) => b.sentAt - a.sentAt);
+  /** The review entries, sorted, with the header and the repaired selection. */
+  review(key: string): { entries: ReviewEntry[]; header: ReturnType<typeof reviewHeader>; selection: string | null; rollup: ReturnType<typeof rollup> } {
+    const g = this.group(key);
+    const entries = computeReviewEntries(g.participants, g.turns, g.awaitingSessionIDs, g.reviewedReplyIDs);
+    g.reviewSelection = repairSelection(entries, g.reviewSelection);
+    return { entries, header: reviewHeader(entries), selection: g.reviewSelection, rollup: rollup([...g.latestReports().values()]) };
   }
 
-  /** A delivery is answered when its agent's transcript gained an assistant text turn after it was sent. */
-  refreshDeliveries(): void {
-    const now = this.clock();
-    const pending = [...this.deliveries.values()].filter((d) => d.status === 'delivered');
-    if (pending.length === 0) return;
-    const agents = this.agents().agents;
-    for (const d of pending) {
-      const a = agents.find((x) => x.name === d.agent);
-      if (!a?.transcriptPath) continue;
-      const t = readTranscript(a.transcriptPath, { tail: 20 });
-      const answer = t?.turns.filter((turn) => turn.role === 'assistant' && !turn.toolUse && turn.text && Date.parse(turn.timestamp) > d.sentAt).pop();
-      if (answer) this.answered(d, answer.text, Math.max(now, Date.parse(answer.timestamp)));
+  /** Mark the selected entry reviewed and jump to the next unreviewed one. */
+  markReviewed(key: string, sessionID: string): string | null {
+    const g = this.group(key);
+    const { entries } = this.review(key);
+    const e = entries.find((x) => x.sessionID === sessionID);
+    if (!e || !e.latestReplyID) return g.reviewSelection;
+    g.reviewedReplyIDs.set(sessionID, e.latestReplyID);
+    const after = computeReviewEntries(g.participants, g.turns, g.awaitingSessionIDs, g.reviewedReplyIDs);
+    g.reviewSelection = nextUnreviewed(after, sessionID) ?? sessionID;
+    this.emit({ type: 'group', key });
+    return g.reviewSelection;
+  }
+
+  closeGroup(key: string): void {
+    this.groups.drop(key);
+    if (this.selection?.kind === 'group' && this.selection.key === key) this.setSelection(null);
+    this.emit({ type: 'roster' });
+  }
+
+  // ---- volunteers ------------------------------------------------------------------
+
+  get volunteerRequesterName(): string {
+    return this.kv.get<string>(KEYS.volunteerRequester) ?? this.osUserName;
+  }
+  set volunteerRequesterName(name: string) {
+    this.kv.set(KEYS.volunteerRequester, name.trim() || null);
+  }
+
+  /** Find a volunteer: ask everyone messageable (or the given ids), then select the request. */
+  async findVolunteer(input: { requester?: string; title: string; description: string; sessionIDs?: string[] }): Promise<VolunteerRequest> {
+    const requester = (input.requester ?? this.volunteerRequesterName).trim();
+    const title = input.title.trim();
+    const description = input.description.trim();
+    if (!requester || !title || !description) throw new Error('A volunteer request needs your name, a task and a description.');
+    if (input.requester) this.volunteerRequesterName = requester;
+    const recipients = input.sessionIDs ? input.sessionIDs.map((id) => this.requireAgent(id)) : this.messageableAgents;
+    const request = new VolunteerRequest(requester, title, description, recipients, {
+      clock: this.clock,
+      sleep: this.sleep,
+      sendInbox: this.sendInboxFn,
+      transcriptSize: async (a) => (await this.conversationsDeps().readTail(this.transcriptFor(a))).endOffset,
+      readSince: async (a, offset) => {
+        const r = await this.conversationsDeps().readSince(this.transcriptFor(a), offset);
+        return { texts: r.turns.filter((t) => t.role === 'assistant').map((t) => t.text), endOffset: r.endOffset };
+      },
+      spawn: async (s) => {
+        const { jobID } = await this.spawner.spawnBackground({ name: s.name, cwd: s.cwd, model: s.model, permissionMode: this.settings.permissionMode, prompt: s.prompt });
+        void this.refresh();
+        return { jobID };
+      },
+      onChange: (r) => this.emit({ type: 'volunteer', id: r.id }),
+    });
+    this.volunteers.set(request.id, request);
+    this.setSelection({ kind: 'volunteer', id: request.id });
+    await request.start();
+    return request;
+  }
+
+  private transcriptFor(a: Agent): string {
+    return transcriptPath(a.cwd, a.sessionID, this.settings.claudeDir);
+  }
+
+  private conversationsDeps(): { readTail: (p: string) => Promise<TranscriptRead>; readSince: (p: string, o: number) => Promise<TranscriptRead> } {
+    // The stores were built with the same injected readers; reach them through a thread-less call.
+    return (this.conversations as unknown as { deps: { readTail: (p: string) => Promise<TranscriptRead>; readSince: (p: string, o: number) => Promise<TranscriptRead> } }).deps;
+  }
+
+  volunteer(id: string): VolunteerRequest {
+    const v = this.volunteers.get(id);
+    if (!v) throw new Error(`No volunteer request ${id}.`);
+    return v;
+  }
+
+  /** The agent the roster lists for a request's assignee, once it shows up. */
+  assigneeAgent(id: string): Agent | null {
+    const v = this.volunteer(id);
+    return this.visibleAgents.find((a) => v.matchesAssignee(a)) ?? null;
+  }
+
+  closeVolunteer(id: string): void {
+    this.volunteer(id).close();
+    this.volunteers.delete(id);
+    if (this.selection?.kind === 'volunteer' && this.selection.id === id) this.setSelection(null);
+    this.emit({ type: 'roster' });
+  }
+
+  /** The spawn sheet's defaults and directory choices. */
+  spawnDefaults(title: string): { name: string; model: string; directories: string[] } {
+    const dirs: string[] = [];
+    for (const d of [this.settings.repoPath, ...this.visibleAgents.map((a) => a.cwd)]) if (d && !dirs.includes(d)) dirs.push(d);
+    return { name: title.trim().slice(0, 60), model: this.settings.planningModel, directories: dirs };
+  }
+
+  async spawnAgent(input: { name: string; model?: string; cwd: string; prompt: string }): Promise<string> {
+    const { jobID } = await this.spawner.spawnBackground({ ...input, permissionMode: this.settings.permissionMode });
+    this.toast(`Started ${input.name}. It shows up in the list in a few seconds.`);
+    void this.refresh();
+    return jobID;
+  }
+
+  // ---- pause, resume, done, rename (§5.8) --------------------------------------------
+
+  async pauseAgents(): Promise<void> {
+    if (this.isPausing) return;
+    const running = this.visibleAgents.filter((a) => !isStopped(a));
+    if (running.length === 0) return;
+    this.ledger.recordPause(running);
+    this.isPausing = true;
+    this.emit({ type: 'roster' });
+    const failed: string[] = [];
+    try {
+      for (const a of running) {
+        const ok = isMessageable(a) ? await this.conversations.conversation(a).sendInstruction(pauseMessage(this.ledger.displayName(a))) : false;
+        if (!ok) failed.push(this.ledger.displayName(a));
+      }
+    } finally {
+      this.isPausing = false;
     }
+    const kept = this.ledger.resumeSet?.entries.length ?? 0;
+    this.toast(`Asked ${running.length} agent(s) to pause. Resume Agents brings back these ${kept}, even after a reboot.${failed.length ? ` Couldn’t reach: ${failed.join(', ')}.` : ''}`);
+    this.emit({ type: 'roster' });
   }
 
-  private answered(d: Delivery, reply: string, at: number): void {
-    d.status = 'answered';
-    d.answeredAt = at;
-    d.reply = reply;
-    this.emit({ type: 'delivery', at, delivery: d });
-  }
-
-  // ---- the peer channel, inbound ----------------------------------------
-
-  private onFrame(frame: Frame, captured: CapturedFrame): unknown {
-    const now = this.clock();
-    this.emit({ type: 'frame', at: now, captured });
-    const from = typeof frame.from === 'string' ? frame.from : null;
-    const text = frameText(frame);
-    if (!from || !text) return { ok: true };
-    const parsed = parseVolunteerReply(text);
-    if (parsed) {
-      const round = this.roundFor(text, from);
-      if (round) {
+  async resumeAgents(): Promise<void> {
+    if (this.isResuming) return;
+    const set = this.ledger.resumeSet;
+    if (!set) return;
+    const visible = this.visibleAgents;
+    const present = set.entries.map((e) => visible.find((a) => a.sessionID === e.sessionID)).filter((a): a is Agent => !!a);
+    if (present.length === 0) {
+      this.ledger.dismissResumeSet();
+      this.emit({ type: 'roster' });
+      return;
+    }
+    const targets = present.filter((a) => !this.conversations.existing(a.sessionID)?.isResuming);
+    this.isResuming = true;
+    this.emit({ type: 'roster' });
+    const successes: string[] = [];
+    const failures: string[] = [];
+    try {
+      for (const a of targets) {
+        const prompt = resumeMessage(this.ledger.displayName(a), set.paused);
         try {
-          round.reply({ agent: from, ...parsed }, now);
-          this.emit({ type: 'volunteer', at: now, view: this.view(round.request.id)! });
-          return { ok: true, request: round.request.id };
+          if (isMessageable(a)) await this.sendInboxFn(a, prompt);
+          else if (isStopped(a)) await this.spawner.resume(a, prompt);
+          else throw new Error(NO_INBOX_MESSAGE);
+          successes.push(a.sessionID);
         } catch (err) {
-          return { ok: false, error: err instanceof Error ? err.message : String(err) };
+          failures.push(`${this.ledger.displayName(a)} (${err instanceof Error ? err.message : String(err)})`);
         }
       }
+    } finally {
+      this.isResuming = false;
     }
-    const waiting = [...this.deliveries.values()].filter((d) => d.agent === from && d.status === 'delivered').sort((a, b) => a.sentAt - b.sentAt)[0];
-    if (waiting) this.answered(waiting, text, now);
-    return { ok: true };
+    this.ledger.markResumed(successes);
+    void this.refresh();
+    this.toast(`Resumed ${successes.length} agent(s).${failures.length ? ` Still waiting: ${failures.join('; ')}` : ''}`);
+    this.emit({ type: 'roster' });
   }
 
-  /** The round a reply belongs to: the one it names, else the newest open round that asked this agent and has no reply from it. */
-  private roundFor(text: string, from: string): VolunteerRound | null {
-    const named = /(?:^|\n)\s*request\s*:\s*(\S+)/i.exec(text)?.[1] ?? /\[agentIM volunteer request (\S+)\]/.exec(text)?.[1];
-    if (named && this.rounds.has(named)) return this.rounds.get(named)!.round;
-    const now = this.clock();
-    const open = [...this.rounds.values()]
-      .map((r) => r.round)
-      .filter((r) => r.request.roster.includes(from) && !r.tally().some((t) => t.agent === from) && r.resolve(now).status === 'open')
-      .sort((a, b) => b.request.createdAt - a.request.createdAt);
-    return open[0] ?? null;
+  dismissResumeSet(): void {
+    this.ledger.dismissResumeSet();
+    this.emit({ type: 'roster' });
   }
 
-  // ---- volunteer rounds --------------------------------------------------
-
-  /**
-   * Open a volunteer round: every live agent (or the roster given) gets the
-   * title and the instruction; the description is withheld. Returns the view
-   * with the delivery outcome per agent.
-   */
-  async volunteer(input: { title: string; description: string; roster?: string[]; windowMs?: number }): Promise<VolunteerView & { deliveries: Delivery[] }> {
-    const now = this.clock();
-    const live = this.agents().agents.filter((a) => a.state !== 'stopped').map((a) => a.name);
-    const names = input.roster ?? live;
-    if (names.length === 0) throw new Error('no live agents to ask');
-    const request: VolunteerRequest = { id: `vr-${randomUUID().slice(0, 8)}`, title: input.title, description: input.description, roster: names, createdAt: now, windowMs: input.windowMs ?? VOLUNTEER_WINDOW_MS };
-    const round = new VolunteerRound(request);
-    this.rounds.set(request.id, { round, spawned: null });
-    const deliveries: Delivery[] = [];
-    for (const name of names) deliveries.push(await this.send(name, volunteerAsk(request, this.name), { fromUser: false, round: request.id }));
-    const view = this.view(request.id)!;
-    this.emit({ type: 'volunteer', at: now, view });
-    return { ...view, deliveries };
-  }
-
-  view(id: string): VolunteerView | null {
-    const entry = this.rounds.get(id);
-    if (!entry) return null;
-    const { round } = entry;
-    return { request: round.request, resolution: round.resolve(this.clock()), replies: round.tally(), briefed: round.released(), spawned: entry.spawned };
-  }
-
-  volunteers(): VolunteerView[] {
-    return [...this.rounds.keys()].map((id) => this.view(id)!).sort((a, b) => b.request.createdAt - a.request.createdAt);
-  }
-
-  /** A reply typed in by hand or relayed by another route, in the two-line format. */
-  volunteerReply(id: string, agent: string, text: string): VolunteerView {
-    const entry = this.rounds.get(id);
-    if (!entry) throw new Error(`no volunteer request ${id}`);
-    const parsed = parseVolunteerReply(text);
-    if (!parsed) throw new Error('a reply has a `volunteer: yes | no` line');
-    entry.round.reply({ agent, ...parsed }, this.clock());
-    const view = this.view(id)!;
-    this.emit({ type: 'volunteer', at: this.clock(), view });
-    return view;
-  }
-
-  volunteerPick(id: string, agent: string): VolunteerView {
-    const entry = this.rounds.get(id);
-    if (!entry) throw new Error(`no volunteer request ${id}`);
-    entry.round.pickBy({ agent }, this.clock());
-    const view = this.view(id)!;
-    this.emit({ type: 'volunteer', at: this.clock(), view });
-    return view;
-  }
-
-  /**
-   * Settle a round whose resolution is `picked` and not yet briefed: the
-   * briefing goes to the winner first; only after it lands are the others
-   * released. Returns the view; a no-op while the round is open or already
-   * briefed.
-   */
-  async settle(id: string): Promise<VolunteerView> {
-    const entry = this.rounds.get(id);
-    if (!entry) throw new Error(`no volunteer request ${id}`);
-    const { round } = entry;
-    const res = round.resolve(this.clock());
-    if (res.status !== 'picked' || round.released()) return this.view(id)!;
-    const briefing = await this.send(res.winner, briefingText(round.request), { round: id });
-    if (briefing.status === 'unreachable') throw new Error(`the briefing did not reach ${res.winner}: ${briefing.error}`);
-    round.briefed(this.clock());
-    for (const other of round.request.roster) if (other !== res.winner) await this.send(other, releaseText(round.request, res.winner), { fromUser: false, round: id });
-    const view = this.view(id)!;
-    this.emit({ type: 'volunteer', at: this.clock(), view });
-    return view;
-  }
-
-  /** Every round that resolved to a pick and is not yet briefed, settled: the caller runs this on a timer. */
-  async settleAll(): Promise<VolunteerView[]> {
-    const out: VolunteerView[] = [];
-    for (const [id, entry] of this.rounds) {
-      if (entry.round.released() || entry.spawned) continue;
-      if (entry.round.resolve(this.clock()).status === 'picked') out.push(await this.settle(id));
+  /** Done: ask the session to clean up and journal, then archive it; only after the send succeeds. */
+  async done(sessionID: string): Promise<void> {
+    if (this.donePending.has(sessionID)) return;
+    const agent = this.requireAgent(sessionID);
+    const name = this.ledger.displayName(agent);
+    if (!isMessageable(agent)) {
+      this.archiveAgent(agent);
+      this.toast(`${name} has no live inbox, so nothing was sent. Archived it.`);
+      return;
     }
-    return out;
-  }
-
-  /** "Nobody volunteered": start a fresh agent with the briefing as its first prompt. */
-  async volunteerSpawn(id: string, input: { mode: 'interactive' | 'background'; repo: string; agent?: string }): Promise<VolunteerView> {
-    const entry = this.rounds.get(id);
-    if (!entry) throw new Error(`no volunteer request ${id}`);
-    if (entry.spawned) throw new Error(`already started ${entry.spawned.agent}`);
-    const agent = input.agent ?? `vol-${id.replace(/^vr-/, '')}`;
-    const briefing = `${entry.round.request.title}\n\n${entry.round.request.description}`;
-    const where = await this.spawn({ mode: input.mode, agent, repo: input.repo, prompt: briefing });
-    entry.spawned = { mode: input.mode, agent, where };
-    const view = this.view(id)!;
-    this.emit({ type: 'volunteer', at: this.clock(), view });
-    return view;
-  }
-
-  // ---- starting agents ---------------------------------------------------
-
-  /** Start an agent; returns where it runs (the tmux session or the worktree). */
-  async spawn(input: { mode: 'interactive' | 'background'; agent: string; repo: string; prompt?: string; claudeBin?: string }): Promise<string> {
-    let where: string;
-    if (input.mode === 'interactive') where = (await spawnInteractive({ agent: input.agent, cwd: input.repo, prompt: input.prompt, claudeBin: input.claudeBin }, this.run)).tmuxSession;
-    else {
-      if (!input.prompt) throw new Error('a background agent needs a briefing');
-      where = (await spawnBackground({ agent: input.agent, repo: input.repo, briefing: input.prompt, worktreesDir: this.opts.worktreesDir ?? `${input.repo}/.agentim-worktrees`, claudeBin: input.claudeBin }, this.run)).worktree;
+    this.donePending.add(sessionID);
+    this.emit({ type: 'roster' });
+    try {
+      const ok = await this.conversations.conversation(agent).sendInstruction(WRAP_UP);
+      if (!ok) {
+        this.toast(`Couldn’t reach ${name}: ${this.conversations.existing(sessionID)?.errorMessage ?? 'the send failed'}. It stays in the list.`);
+        return;
+      }
+      this.archiveAgent(agent);
+      this.toast(`Asked ${name} to clean up worktrees and journal, then archived it.`);
+    } finally {
+      this.donePending.delete(sessionID);
+      this.emit({ type: 'roster' });
     }
-    this.emit({ type: 'spawn', at: this.clock(), mode: input.mode, agent: input.agent, where });
-    return where;
   }
 
-  openInTerminal(agent: string): Promise<void> {
-    return openInTerminal(agent, this.run);
+  private archiveAgent(agent: Agent): void {
+    if (this.selection?.kind === 'agent' && this.selection.sessionID === agent.sessionID) this.setSelection(null);
+    this.ledger.forget([agent.sessionID]);
+    this.conversations.drop(agent.sessionID);
+    this.archive.archive({ ...agent, name: this.ledger.displayName(agent) });
+    this.emit({ type: 'roster' });
   }
 
-  // ---- claims ------------------------------------------------------------
+  restoreArchived(sessionID: string): void {
+    this.archive.restore(sessionID);
+    this.emit({ type: 'roster' });
+  }
+
+  /** Rename in cIM, then tell the user what else is needed; the CLI's own name cannot be changed from outside a running session. */
+  async rename(sessionID: string, name: string): Promise<Toast> {
+    const agent = this.requireAgent(sessionID);
+    this.ledger.rename(sessionID, name);
+    const shown = this.ledger.displayName(agent);
+    this.emit({ type: 'roster' });
+    if (isStopped(agent)) {
+      return agent.kind === 'interactive'
+        ? this.toast(`Renamed to ${shown}. Claude Code takes the name too when cIM resumes it.`)
+        : this.toast(`Renamed to ${shown} in cIM. A background job keeps its launch name in /resume; cIM tells it the new one when it resumes.`);
+    }
+    if (isMessageable(agent)) await this.sendInboxFn(agent, renameNotice(shown)).catch(() => undefined);
+    const where = agent.kind === 'interactive' ? 'in its terminal' : `after \`claude attach ${shortID(agent)}\``;
+    return this.toast(`Renamed to ${shown} in cIM. Copied \`/rename ${shown}\` to the clipboard; run it ${where} to rename the session itself.`, `/rename ${shown}`);
+  }
+
+  // ---- the status chip's chores (§7.4) ---------------------------------------------------
+
+  private async sendChore(target: { sessionID?: string; groupKey?: string }, agent: Agent, text: string): Promise<boolean> {
+    if (target.groupKey) return this.group(target.groupKey).sendInstruction(text, agent);
+    return this.conversations.conversation(agent).sendInstruction(text);
+  }
+
+  /** The wiki chore button. `confirmed` is the alert's answer for the needs-attention case. */
+  async wikiChore(target: { sessionID?: string; groupKey?: string }, agentID: string, report: StatusReport, confirmed = false): Promise<ChoreOutcome> {
+    const agent = this.requireAgent(agentID);
+    const state = choreStates(report).wiki;
+    if (state === 'done') {
+      if (!report.wikiEntry) {
+        this.toast(`${agent.name} marked the session journaled but gave no entry path.`);
+        return { action: 'nothing' };
+      }
+      return { action: 'open-wiki-entry', path: report.wikiEntry, searchDirs: [agent.cwd, ...(this.settings.repoPath ? [this.settings.repoPath] : [])] };
+    }
+    if (state === 'needs-attention' && !confirmed) return { action: 'needs-confirmation', reasons: ['the session has not completed its assigned tasks'], text: 'Write incomplete session to wiki?' };
+    const text = state === 'needs-attention' ? JOURNAL_INCOMPLETE : JOURNAL_NOW;
+    await this.sendChore(target, agent, text);
+    return { action: 'sent', text };
+  }
+
+  /** The worktrees chore button: git checks first; confirmation when the session is not complete, the finding is concerning, or a check could not run. */
+  async worktreeChore(target: { sessionID?: string; groupKey?: string }, agentID: string, report: StatusReport, confirmed = false): Promise<ChoreOutcome> {
+    const agent = this.requireAgent(agentID);
+    if (choreStates(report).worktrees === 'done') return { action: 'nothing' };
+    const finding = await this.gitChecks(agent.cwd);
+    const decision = worktreeDecision(report, finding);
+    if (decision.reasons.length && !confirmed) return { action: 'needs-confirmation', reasons: decision.reasons, text: 'Clean Up Anyway' };
+    const text = decision.reasons.length ? CLEANUP_ANYWAY : CLEANUP_SAFE;
+    await this.sendChore(target, agent, text);
+    return { action: 'sent', text };
+  }
+
+  /** The TB/UV chore button: a sign-off sheet when done or pending; a resolution ask when it needs attention. */
+  async tbuvChore(target: { sessionID?: string; groupKey?: string }, agentID: string, report: StatusReport): Promise<ChoreOutcome> {
+    const agent = this.requireAgent(agentID);
+    const state = choreStates(report).tbUv;
+    if (state !== 'needs-attention') return { action: 'sign-off', records: await this.tbuvLookup(report.tbUvRefs, agent.cwd) };
+    if (!target.groupKey) {
+      await this.conversations.conversation(agent).sendTBUVSolo();
+      this.toast('Sent TB/UV resolution ask');
+      return { action: 'sent' };
+    }
+    const g = this.group(target.groupKey);
+    const latest = g.latestReports();
+    // Every participant whose current latest status also needs attention, plus the clicking agent even if its own state has since resolved.
+    const targets = g.participants.filter((p) => {
+      if (p.sessionID === agent.sessionID) return true;
+      const r = latest.get(p.sessionID);
+      return !!r && choreStates(r).tbUv === 'needs-attention';
+    });
+    const ok = await g.sendTBUVResolution(targets);
+    this.toast(ok ? 'Sent TB/UV resolution ask' : 'Nobody left to reach for TB/UV resolution');
+    return { action: ok ? 'sent' : 'nothing' };
+  }
+
+  /** "Looks right" / "Needs follow-up" on a sign-off row relays a message to the agent; the GUI never writes the ledger files. */
+  async tbuvReview(target: { sessionID?: string; groupKey?: string }, agentID: string, id: string, looksRight: boolean): Promise<boolean> {
+    return this.sendChore(target, this.requireAgent(agentID), tbuvReviewed(id, looksRight));
+  }
+
+  /** The TB/UV records for a list of ids from the repo's wiki branch ledgers; duplicates keep the first; failures read as not found. */
+  async tbuvLookup(ids: string[], cwd: string): Promise<TbUvRecord[]> {
+    const unique: string[] = [];
+    for (const raw of ids) {
+      const id = raw.trim();
+      if (id && !unique.some((u) => u.toUpperCase() === id.toUpperCase())) unique.push(id);
+    }
+    const read = async (file: string): Promise<Map<string, Record<string, unknown>>> => {
+      const out = new Map<string, Record<string, unknown>>();
+      try {
+        const r = await this.run('git', ['-C', cwd, 'show', `wiki:${file}`], { timeoutMs: 20_000 });
+        if (r.code !== 0) return out;
+        for (const line of r.stdout.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const o = JSON.parse(line) as Record<string, unknown>;
+            const id = String(o.id ?? '').toUpperCase();
+            if (id && !out.has(id)) out.set(id, o);
+          } catch {
+            // a malformed line is skipped, never fatal
+          }
+        }
+      } catch {
+        // git missing or no wiki branch: everything is not found
+      }
+      return out;
+    };
+    const [tombstones, unverified] = await Promise.all([read('tombstones.jsonl'), read('unverified.jsonl')]);
+    return unique.map((id): TbUvRecord => {
+      const key = id.toUpperCase();
+      const tb = tombstones.get(key);
+      if (tb) return { id, kind: 'tombstone', date: str(tb.date ?? tb.ts), claim: str(tb.claim), supersededBy: str(tb.supersededBy ?? tb.superseded_by) };
+      const uv = unverified.get(key);
+      if (uv) return { id, kind: 'unverified', date: str(uv.date ?? uv.ts), claim: str(uv.claim), doubt: str(uv.doubt) };
+      return { id, kind: 'not-found' };
+    });
+  }
+
+  /** Parse a turn as a status report and derive what the chip shows. */
+  chip(text: string): { report: StatusReport; chores: ReturnType<typeof choreStates> } | null {
+    const report = parseStatusReport(text);
+    return report ? { report, chores: choreStates(report) } : null;
+  }
+
+  // ---- harness extras: claims and the canary (markspace review, Items 4 and 5) -------------
 
   claim(input: ClaimInput): Verdict {
     const verdict = this.claims.claim(input, this.clock());
-    this.emit({ type: 'claim', at: this.clock(), verdict });
+    this.emit({ type: 'claim', verdict });
     return verdict;
   }
 
-  complete(claimId: string): boolean {
-    return this.claims.complete(claimId, this.clock());
+  canaryIssue(sessionID: string): { promptLine: string } {
+    const canary = this.canaries.issue(sessionID, this.clock());
+    this.emit({ type: 'canary', sessionID, verdict: 'issued' });
+    return { promptLine: canaryPromptLine(canary) };
   }
 
-  liveClaims(): Claim[] {
-    return this.claims.live(this.clock());
-  }
-
-  // ---- canary ------------------------------------------------------------
-
-  canaryIssue(sessionId: string): { canary: Canary; promptLine: string } {
-    const canary = this.canaries.issue(sessionId, this.clock());
-    this.emit({ type: 'canary', at: this.clock(), sessionId, verdict: 'issued' });
-    return { canary, promptLine: canaryPromptLine(canary) };
-  }
-
-  canaryGate(sessionId: string, call: { tool_name?: string; tool_input?: Record<string, unknown> }): GateVerdict {
-    const verdict = this.canaries.gate(sessionId, toolCallOf(call), this.clock());
-    this.emit({ type: 'canary', at: this.clock(), sessionId, verdict });
+  canaryGate(sessionID: string, call: { tool_name?: string; tool_input?: Record<string, unknown> }): GateVerdict {
+    const tool = call.tool_name ?? '';
+    const args = call.tool_input ?? {};
+    let mapped: { tool: string; args?: Record<string, unknown> } = { tool, args };
+    if (tool === 'Bash' && typeof args.command === 'string') {
+      const m = /^\s*(?:npx\s+)?agentim\s+ack\s+(\S+)\s*$/.exec(args.command);
+      if (m) mapped = { tool: ACK_TOOL, args: { canary: m[1] } };
+    } else if (tool === ACK_TOOL || tool.endsWith(`__${ACK_TOOL}`)) mapped = { tool: ACK_TOOL, args };
+    const verdict = this.canaries.gate(sessionID, mapped, this.clock());
+    this.emit({ type: 'canary', sessionID, verdict });
     return verdict;
   }
 
-  canaryClear(sessionId: string): void {
-    this.canaries.clear(sessionId);
-    this.emit({ type: 'canary', at: this.clock(), sessionId, verdict: 'cleared' });
+  canaryClear(sessionID: string): void {
+    this.canaries.clear(sessionID);
+    this.emit({ type: 'canary', sessionID, verdict: 'cleared' });
   }
 
-  // ---- the status report -------------------------------------------------
-
-  async status(): Promise<StatusReport> {
+  fleet(): FleetReport {
     const now = this.clock();
-    const { agents } = this.agents();
-    const nameOf = new Map(agents.map((a) => [a.sessionId, a.name]));
-    const worktrees: WorktreeFact[] = [];
-    for (const repo of this.opts.repos ?? []) {
-      for (const w of await listWorktrees(repo.path, repo.baseBranch ?? 'main', this.run)) {
-        const agent = agents.find((a) => a.cwd === w.path)?.name;
-        worktrees.push({ ...w, ...(agent ? { agent } : {}) });
-      }
-    }
-    const canaries = this.canaries.all().map((c) => ({ ...c, sessionId: nameOf.get(c.sessionId) ?? c.sessionId }));
-    return buildStatusReport(
+    const agents = this.visibleAgents;
+    const nameOf = new Map(agents.map((a) => [a.sessionID, a.name]));
+    return buildFleetReport(
       {
-        agents: agents.map((a) => ({ name: a.name, mode: a.mode, cwd: a.cwd, lastActivityAt: a.lastActivityAt, stopped: a.state === 'stopped' })),
-        worktrees,
-        claims: this.liveClaims(),
-        canaries,
-        idleAfterMs: this.opts.idleAfterMs,
+        agents: agents.map((a) => ({ name: a.name, mode: a.kind, cwd: a.cwd, lastActivityAt: isStopped(a) ? null : a.startedAt, stopped: isStopped(a) })),
+        worktrees: [],
+        claims: this.claims.live(now),
+        canaries: this.canaries.all().map((c) => ({ ...c, sessionId: nameOf.get(c.sessionId) ?? c.sessionId })),
       },
       now
     );
   }
+
+  // ---- a snapshot for the panel ------------------------------------------------------
+
+  snapshot(): HubSnapshot {
+    const visible = this.visibleAgents;
+    return {
+      at: this.clock(),
+      roster: { agents: visible, hasLoaded: this.roster.hasLoaded, isRefreshing: this.roster.isRefreshing, lastError: this.roster.lastError, liveCount: this.liveCount },
+      selection: this.selection,
+      resumeSet: this.ledger.resumeSet,
+      inFlight: this.ledger.inFlight,
+      archived: this.archive.entries,
+      groups: this.groups.all().map((g) => ({ key: g.key, participants: g.participants.map((p) => ({ sessionID: p.sessionID, name: p.name })), isAwaitingReply: g.isAwaitingReply, isReviewing: g.isReviewing })),
+      volunteers: [...this.volunteers.values()].map((v) => ({ id: v.id, title: v.title, phase: v.phase, volunteers: v.volunteers.length, assignee: v.assignee?.name ?? null })),
+      flags: { isPausing: this.isPausing, isResuming: this.isResuming, donePending: [...this.donePending] },
+      toasts: this.toasts.slice(-10),
+      settings: { ...this.settings, statePath: undefined },
+      volunteerRequesterName: this.volunteerRequesterName,
+      projectNames: Object.fromEntries(visible.map((a) => [a.sessionID, projectName(a)])),
+    };
+  }
 }
+
+export interface HubSnapshot {
+  at: number;
+  roster: { agents: Agent[]; hasLoaded: boolean; isRefreshing: boolean; lastError: string | null; liveCount: number };
+  selection: Selection;
+  resumeSet: SessionLedger['resumeSet'];
+  inFlight: SessionLedger['inFlight'];
+  archived: Archive['entries'];
+  groups: Array<{ key: string; participants: Array<{ sessionID: string; name: string }>; isAwaitingReply: boolean; isReviewing: boolean }>;
+  volunteers: Array<{ id: string; title: string; phase: string; volunteers: number; assignee: string | null }>;
+  flags: { isPausing: boolean; isResuming: boolean; donePending: string[] };
+  toasts: Toast[];
+  settings: Omit<Settings, 'statePath'> & { statePath?: undefined };
+  volunteerRequesterName: string;
+  projectNames: Record<string, string>;
+}
+
+const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : v === undefined || v === null ? undefined : String(v));
+
+function safeUserName(): string {
+  try {
+    return userInfo().username;
+  } catch {
+    return 'me';
+  }
+}
+
+export { groupKey, failureText, type ChoreState };

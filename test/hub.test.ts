@@ -1,176 +1,288 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { Hub, toolCallOf, volunteerAsk, type HubEvent } from '../src/hub.js';
-import { USER_HEADING } from '../src/transport.js';
-import { ACK_TOOL } from '../src/canary.js';
-import type { Runner } from '../src/spawn.js';
-import { world, type World, type FakeAgent } from './fixture.js';
+import { Hub } from '../src/hub.js';
+import { serve, type Daemon } from '../src/daemon.js';
+import { MemoryKV } from '../src/store.js';
+import { WRAP_UP, STATUS_CHECK, JOURNAL_NOW, CLEANUP_SAFE, CLEANUP_ANYWAY, TBUV_RESOLUTION_GROUP, TBUV_RESOLUTION_SOLO, HUMAN_TAG } from '../src/prompts.js';
+import { parseStatusReport, type WorktreeFinding } from '../src/status-report.js';
+import type { Agent, Turn } from '../src/agent.js';
+import type { TranscriptRead } from '../src/transcript.js';
+import type { Runner } from '../src/runner.js';
 
-let w: World;
-let hub: Hub | null = null;
-afterEach(async () => {
-  if (hub) await hub.stop();
-  hub = null;
-  if (w) await w.dispose();
-});
+const T0 = Date.parse('2026-10-16T12:00:00.000Z');
+const statusBlock = (status: string, extra = '') => `\`\`\`cim-status\nscope: MR 1\nstatus: ${status}\n${extra}\`\`\``;
 
-const calls: Array<{ cmd: string; args: string[] }> = [];
-const fakeRun: Runner = async (cmd, args) => {
-  calls.push({ cmd, args });
-  return { code: 0, stdout: '', stderr: '', pid: 1 };
-};
-
-async function setup(): Promise<{ a: FakeAgent; b: FakeAgent; events: HubEvent[] }> {
-  w = await world();
-  const a = await w.agent('instrument-62');
-  const b = await w.agent('instrument-66');
-  hub = new Hub({ claudeDir: w.claudeDir, socketDir: w.socketDir, name: 'agentim', cwd: w.root, pid: 90_000, clock: w.clock, alive: () => true, run: fakeRun, idleAfterMs: 5 * 60_000, repos: [] });
-  const events: HubEvent[] = [];
-  hub.subscribe((e) => events.push(e));
-  await hub.start();
-  return { a, b, events };
-}
-
-/** An agent replies to the daemon over the peer channel, the way SendMessage would. */
-async function peerReply(agent: FakeAgent, text: string) {
-  const { sendFrame } = await import('../src/transport.js');
-  return sendFrame(hub!.inbox.socketPath, { action: 'message', msg_id: 'm1', from: agent.name, from_mode: 'interactive', text });
+function world() {
+  let now = T0;
+  let roster: Agent[] = [];
+  const files = new Map<string, Turn[]>();
+  const sent: Array<{ to: string; text: string }> = [];
+  const runs: string[][] = [];
+  const failing = new Set<string>();
+  let finding: WorktreeFinding = { dirty: false, unpushed: 0 };
+  const run: Runner = async (cmd, args) => {
+    runs.push([cmd, ...args]);
+    if (args[0] === '--bg' && !args.includes('--resume')) return { code: 0, stdout: 'backgrounded · beef01 · x', stderr: '' };
+    if (cmd === 'git' && args[2] === 'show' && args[3] === 'wiki:tombstones.jsonl') return { code: 0, stdout: '{"id":"TB-0042","date":"2026-10-01","claim":"the old API is gone"}\n{"id":"TB-0042","claim":"dup"}\n', stderr: '' };
+    if (cmd === 'git' && args[2] === 'show') return { code: 128, stdout: '', stderr: 'no such ref' };
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  const hub = new Hub({
+    kv: new MemoryKV(),
+    clock: () => now,
+    sleep: (ms) =>
+      new Promise<void>((r) => {
+        now += ms;
+        setImmediate(r);
+      }),
+    run,
+    alive: () => false,
+    listAgents: async () => roster,
+    sendInbox: async (a, text) => {
+      if (failing.has(a.sessionID)) throw new Error(`refused by ${a.name}`);
+      sent.push({ to: a.sessionID, text });
+    },
+    readTail: async (p): Promise<TranscriptRead> => ({ turns: (files.get(p) ?? []).slice(-40), endOffset: (files.get(p) ?? []).length, latestModel: null }),
+    readSince: async (p, o): Promise<TranscriptRead> => ({ turns: (files.get(p) ?? []).slice(o), endOffset: (files.get(p) ?? []).length, latestModel: null }),
+    gitChecks: async () => finding,
+    osUserName: 'johnny',
+    settings: { repoPath: '/Repos/wiki', claudeDir: '/claude', claudePath: process.execPath },
+  });
+  const agent = (id: string, over: Partial<Agent> = {}): Agent => ({ sessionID: id, pid: 1, name: `agent-${id}`, cwd: `/r/${id}`, kind: 'interactive', status: 'idle', startedAt: T0, inboxSocketPath: `/tmp/${id}`, ...over });
+  const transcript = (a: Agent) => `/claude/projects/-r-${a.sessionID}/${a.sessionID}.jsonl`;
+  const append = (a: Agent, role: 'user' | 'assistant', text: string) => {
+    const p = transcript(a);
+    const list = files.get(p) ?? [];
+    list.push({ id: `${a.sessionID}-${list.length}`, role, text, timestamp: (now += 1) });
+    files.set(p, list);
+  };
+  return { hub, agent, append, sent, runs, failing, setRoster: (r: Agent[]) => (roster = r), setFinding: (f: WorktreeFinding) => (finding = f), now: () => now };
 }
 
 describe('the hub', () => {
-  it('lists the roster without itself and reads a transcript', async () => {
-    const { a } = await setup();
-    const names = hub!.agents().agents.map((x) => x.name);
-    expect(names).toEqual(['instrument-62', 'instrument-66']);
-    expect(hub!.agent(a.sessionId)?.name).toBe('instrument-62');
-    expect(hub!.transcript('instrument-62')!.turns.map((t) => t.text)).toEqual(['hello', 'ready']);
+  it('decorates the roster, pauses with the ledger first, resumes paused sessions by inbox or CLI, and marks them in flight', async () => {
+    const w = world();
+    const [a, b] = [w.agent('A'), w.agent('B', { kind: 'background', jobID: 'B' })];
+    w.setRoster([a, b]);
+    await w.hub.refresh();
+    expect(w.hub.visibleAgents.map((x) => x.sessionID)).toEqual(['A', 'B']);
+    expect(w.hub.liveCount).toBe(2);
+    await w.hub.rename('A', 'Reviewer');
+    expect(w.hub.toasts.at(-1)!.clipboard).toBe('/rename Reviewer');
+    expect(w.sent.at(-1)!.text).toMatch(/now “Reviewer”/);
+    w.failing.add('B');
+    await w.hub.pauseAgents();
+    expect(w.hub.ledger.resumeSet).toMatchObject({ paused: true });
+    expect(w.hub.ledger.resumeSet!.entries.map((e) => e.name)).toEqual(['Reviewer', 'agent-B']); // the cIM name rides along
+    expect(w.hub.toasts.at(-1)!.text).toBe('Asked 2 agent(s) to pause. Resume Agents brings back these 2, even after a reboot. Couldn’t reach: agent-B.');
+    expect(w.sent.filter((s) => s.to === 'A').at(-1)!.text).toMatch(/pausing every running agent/);
+    expect(w.sent.filter((s) => s.to === 'A').at(-1)!.text).not.toContain(HUMAN_TAG);
+    // After a reboot: A is gone, B is listed stopped
+    w.failing.clear();
+    w.setRoster([{ ...b, pid: undefined, inboxSocketPath: undefined, status: undefined }]);
+    await w.hub.refresh();
+    const visible = w.hub.visibleAgents;
+    expect(visible.map((x) => [x.sessionID, x.pid, x.name])).toEqual([
+      ['B', undefined, 'agent-B'],
+      ['A', undefined, 'Reviewer'],
+    ]); // A is a stand-in from the paused set
+    await w.hub.resumeAgents();
+    const cli = w.runs.filter((r) => r[0] === process.execPath && r[1] === '--bg');
+    expect(cli.map((r) => r[3])).toEqual(['A', 'B']); // both resumed through the CLI in resume-set order: neither has an inbox
+    expect(cli.find((r) => r[3] === 'A')).toContain('--name'); // interactive keeps its name
+    expect(cli.find((r) => r[3] === 'B')).not.toContain('--name'); // a flag would fork the background job
+    expect(w.hub.ledger.resumeSet).toBeNull();
+    expect(w.hub.ledger.inFlight.map((e) => e.sessionID).sort()).toEqual(['A', 'B']);
+    expect(w.hub.toasts.at(-1)!.text).toBe('Resumed 2 agent(s).');
+    for (const c of w.hub.conversations.all()) await c.settle();
   });
 
-  it('delivers a user message under the heading and waits until the agent answers over the channel', async () => {
-    const { a, events } = await setup();
-    const d = await hub!.send('instrument-62', 'please rebase');
-    expect(d.status).toBe('delivered');
-    expect(a.texts()[0]).toBe(`${USER_HEADING}\n\nplease rebase`);
-    expect(a.received[0]).toMatchObject({ action: 'message', from: 'agentim', to: 'instrument-62' });
-    w.now += 4000;
-    await peerReply(a, 'rebased, pushed');
-    const after = hub!.delivery(d.id)!;
-    expect(after).toMatchObject({ status: 'answered', reply: 'rebased, pushed', answeredAt: w.now });
-    expect(events.filter((e) => e.type === 'delivery')).toHaveLength(2);
+  it('Done asks for the wrap-up and archives only after the send succeeds; a dead session is archived at once', async () => {
+    const w = world();
+    const [a, b, c] = [w.agent('A'), w.agent('B'), w.agent('C', { pid: undefined, inboxSocketPath: undefined })];
+    w.setRoster([a, b, c]);
+    await w.hub.refresh();
+    await w.hub.selectAgent('A');
+    expect(w.hub.selection).toEqual({ kind: 'agent', sessionID: 'A' });
+    await w.hub.done('A');
+    expect(w.sent.at(-1)).toMatchObject({ to: 'A' });
+    expect(w.sent.at(-1)!.text.endsWith(WRAP_UP)).toBe(true);
+    expect(w.hub.archive.has('A')).toBe(true);
+    expect(w.hub.selection).toBeNull();
+    expect(w.hub.visibleAgents.map((x) => x.sessionID)).toEqual(['B', 'C']);
+    w.failing.add('B');
+    await w.hub.done('B');
+    expect(w.hub.archive.has('B')).toBe(false);
+    expect(w.hub.toasts.at(-1)!.text).toMatch(/Couldn.t reach agent-B/);
+    await w.hub.done('C');
+    expect(w.hub.archive.has('C')).toBe(true);
+    expect(w.hub.toasts.at(-1)!.text).toBe('agent-C has no live inbox, so nothing was sent. Archived it.');
+    w.hub.restoreArchived('A');
+    expect(w.hub.visibleAgents.map((x) => x.sessionID)).toEqual(['A', 'B']);
+    for (const t of w.hub.conversations.all()) await t.settle();
   });
 
-  it('also treats the agent’s next assistant turn in its transcript as the answer', async () => {
-    const { b } = await setup();
-    w.now += 1000;
-    const d = await hub!.send('instrument-66', 'status?');
-    w.now += 7000;
-    w.transcriptLine(b.cwd, b.sessionId, { type: 'assistant', sessionId: b.sessionId, cwd: b.cwd, timestamp: new Date(w.now).toISOString(), uuid: 'a9', message: { role: 'assistant', content: [{ type: 'text', text: 'all green' }] } });
-    expect(hub!.deliveriesList()[0]).toMatchObject({ id: d.id, status: 'answered', reply: 'all green' });
-  });
-
-  it('marks a stopped or socket-less agent unreachable instead of hanging', async () => {
-    await setup();
-    const { writeRegistry } = await import('./fixture.js');
-    writeRegistry(w.claudeDir, { pid: 5, sessionId: 'nosock', cwd: '/x', kind: 'interactive', name: 'mute' });
-    const d = await hub!.send('mute', 'hello?');
-    expect(d.status).toBe('unreachable');
-    await expect(hub!.send('nobody', 'x')).rejects.toThrow(/no agent named nobody/);
-  });
-
-  it('runs a volunteer round: title only, replies over the channel, the briefing reaches the winner before the others are released', async () => {
-    const { a, b } = await setup();
-    const opened = await hub!.volunteer({ title: 'MR !1267 merge conflicts', description: 'SECRET: three files in Sources/Core' });
-    expect(opened.request.roster).toEqual(['instrument-62', 'instrument-66']);
-    expect(opened.resolution.status).toBe('open');
-    expect(opened.deliveries.map((d) => d.status)).toEqual(['delivered', 'delivered']);
-    for (const agent of [a, b]) {
-      expect(agent.texts()[0]).toBe(volunteerAsk(opened.request, 'agentim'));
-      expect(agent.texts()[0]).not.toContain('SECRET');
-    }
-    w.now += 5000;
-    await peerReply(a, `request: ${opened.request.id}\nvolunteer: no\ncontext: mid-merge on qp27110`);
-    w.now += 5000;
-    await peerReply(b, 'volunteer: yes\ncontext: I touched Sources/Core yesterday\nconfidence: 0.7'); // no request line: routed to the open round
-    let view = hub!.view(opened.request.id)!;
-    expect(view.replies.map((r) => [r.agent, r.volunteer, r.confidence, r.late])).toEqual([
-      ['instrument-62', false, 0, false],
-      ['instrument-66', true, 0.7, false],
+  it('a status check opens the group in review mode; chores send the right instruction or ask for confirmation', async () => {
+    const w = world();
+    const [a, b] = [w.agent('A'), w.agent('B')];
+    w.setRoster([a, b]);
+    await w.hub.refresh();
+    const g = await w.hub.statusCheck();
+    expect(g.isReviewing).toBe(true);
+    expect(w.hub.selection).toEqual({ kind: 'group', key: 'A+B' });
+    expect(w.sent.filter((s) => s.text.endsWith(STATUS_CHECK)).map((s) => s.to).sort()).toEqual(['A', 'B']);
+    w.append(a, 'assistant', statusBlock('done', 'worktrees_cleaned: false\ntb_uv_cleared: false\ntb_uv_refs:\n- TB-0042\n- UV-0007\n- tb-0042\n'));
+    w.append(b, 'assistant', statusBlock('working', 'wiki_journaled: false\n'));
+    await g.pollOnce();
+    const review = w.hub.review('A+B');
+    expect(review.entries.map((e) => [e.sessionID, e.state, e.report?.status])).toEqual([
+      ['B', 'replied', 'working'],
+      ['A', 'replied', 'done'],
     ]);
-    expect(view.resolution.status).toBe('open');
-    expect((await hub!.settleAll()).length).toBe(0);
-
-    w.now += 30_000;
-    view = hub!.view(opened.request.id)!;
-    expect(view.resolution).toMatchObject({ status: 'picked', winner: 'instrument-66', by: 'confidence' });
-    expect(view.briefed).toBe(false);
-    const settled = await hub!.settleAll();
-    expect(settled).toHaveLength(1);
-    expect(settled[0].briefed).toBe(true);
-    expect(b.texts()[1]).toContain('SECRET: three files in Sources/Core');
-    expect(a.texts()[1]).toMatch(/is taken by instrument-66/);
-    expect(a.texts()).toHaveLength(2);
-    // Settling again is a no-op; the briefing went out once
-    await hub!.settle(opened.request.id);
-    expect(b.texts()).toHaveLength(2);
-  });
-
-  it('lets a person pick anyone, and starts a fresh agent when nobody volunteered', async () => {
-    const { a, b } = await setup();
-    const r1 = await hub!.volunteer({ title: 'docs sweep', description: 'd1' });
-    hub!.volunteerPick(r1.request.id, 'instrument-62');
-    const v1 = await hub!.settle(r1.request.id);
-    expect(v1.resolution).toMatchObject({ status: 'picked', winner: 'instrument-62', by: 'person' });
-    expect(a.texts().at(-1)).toContain('d1');
-    expect(b.texts().at(-1)).toMatch(/taken by instrument-62/);
-
-    const r2 = await hub!.volunteer({ title: 'flaky test', description: 'd2' });
-    hub!.volunteerReply(r2.request.id, 'instrument-62', 'volunteer: no\ncontext: busy');
-    w.now += 31_000;
-    const v2 = hub!.view(r2.request.id)!;
-    expect(v2.resolution).toMatchObject({ status: 'nobody', declined: ['instrument-62'], silent: ['instrument-66'] });
-    calls.length = 0;
-    const spawned = await hub!.volunteerSpawn(r2.request.id, { mode: 'background', repo: '/Repos/instrument' });
-    expect(spawned.spawned).toMatchObject({ mode: 'background', agent: `vol-${r2.request.id.slice(3)}` });
-    expect(calls[0].args.slice(0, 4)).toEqual(['-C', '/Repos/instrument', 'worktree', 'add']);
-    expect(calls[1]).toMatchObject({ cmd: 'claude' });
-    expect(calls[1].args[1]).toBe('flaky test\n\nd2');
-    await expect(hub!.volunteerSpawn(r2.request.id, { mode: 'background', repo: '/r' })).rejects.toThrow(/already started/);
-  });
-
-  it('maps hook tool calls onto the canary gate: `agentim ack <id>` from Bash is the acknowledgment', async () => {
-    await setup();
-    const { canary, promptLine } = hub!.canaryIssue('sess-1');
-    expect(promptLine).toContain(canary.id);
-    expect(toolCallOf({ tool_name: 'Bash', tool_input: { command: `agentim ack ${canary.id}` } })).toEqual({ tool: ACK_TOOL, args: { canary: canary.id } });
-    expect(toolCallOf({ tool_name: 'mcp__agentim__cim_ack', tool_input: { canary: 'x' } })).toEqual({ tool: ACK_TOOL, args: { canary: 'x' } });
-    expect(toolCallOf({ tool_name: 'Read', tool_input: { file_path: '/a' } })).toEqual({ tool: 'Read', args: { file_path: '/a' } });
-
-    expect(hub!.canaryGate('sess-1', { tool_name: 'Bash', tool_input: { command: `agentim ack ${canary.id}` } })).toEqual({ allow: true, acknowledged: true });
-    expect(hub!.canaryGate('sess-1', { tool_name: 'Read', tool_input: {} })).toEqual({ allow: true, acknowledged: true });
-
-    hub!.canaryIssue('sess-2');
-    expect(hub!.canaryGate('sess-2', { tool_name: 'Bash', tool_input: { command: 'rm -rf /' } })).toEqual({ allow: false, reason: 'unacknowledged', needsReview: true });
-    expect(hub!.canaryGate('sess-2', { tool_name: 'Read', tool_input: {} })).toEqual({ allow: false, reason: 'stopped', needsReview: true });
-    const report = await hub!.status();
-    expect(report.needsReview).toEqual([{ sessionId: 'sess-2', tool: 'Bash', at: w.now }]);
-    hub!.canaryClear('sess-2');
-    expect((await hub!.status()).needsReview).toEqual([]);
-  });
-
-  it('writes claims on an agent’s behalf, first writer wins, and the status report shows them against the clock', async () => {
-    const { a } = await setup();
-    const v1 = hub!.claim({ agent: 'instrument-62', resource: 'QP-26185', verb: 'review', confidence: 0.9, ttlMs: 60_000 });
-    const v2 = hub!.claim({ agent: 'instrument-66', resource: 'QP-26185', verb: 'edit', confidence: 0.5, ttlMs: 60_000 });
-    expect(v1.allowed).toBe(true);
-    expect(v2).toMatchObject({ allowed: false, winner: { agent: 'instrument-62' } });
-    hub!.canaryIssue(a.sessionId);
-    w.now += 30_000;
-    const report = await hub!.status();
-    expect(report.asOf).toBe(w.now);
-    expect(report.agents.map((x) => [x.name, x.state, x.claims.length, x.canary])).toEqual([
-      ['instrument-62', 'busy', 1, 'pending'],
-      ['instrument-66', 'busy', 0, 'none'],
+    expect(review.rollup).toEqual([
+      { status: 'working', count: 1 },
+      { status: 'done', count: 1 },
     ]);
-    w.now += 31_000;
-    expect(hub!.liveClaims()).toEqual([]);
+    expect(review.selection).toBe('B');
+    expect(w.hub.markReviewed('A+B', 'B')).toBe('A');
+    expect(w.hub.review('A+B').header).toEqual({ replied: 2, total: 2, reviewed: 1 });
+    const done = parseStatusReport(w.hub.group('A+B').turns.find((t) => t.sessionID === 'A' && t.turn.role === 'assistant')!.turn.text)!;
+    const working = parseStatusReport(w.hub.group('A+B').turns.find((t) => t.sessionID === 'B' && t.turn.role === 'assistant')!.turn.text)!;
+    // wiki: pending for the working agent sends "journal now"; needs-attention for the done agent asks first
+    expect(await w.hub.wikiChore({ groupKey: 'A+B' }, 'B', working)).toMatchObject({ action: 'sent', text: JOURNAL_NOW });
+    expect(w.sent.at(-1)).toMatchObject({ to: 'B' });
+    expect(await w.hub.wikiChore({ groupKey: 'A+B' }, 'A', done)).toMatchObject({ action: 'needs-confirmation' });
+    expect((await w.hub.wikiChore({ groupKey: 'A+B' }, 'A', done, true)).action).toBe('sent');
+    // worktrees: clean and complete goes the safe path; unknown git state needs confirmation
+    expect(await w.hub.worktreeChore({ groupKey: 'A+B' }, 'A', done)).toMatchObject({ action: 'sent', text: CLEANUP_SAFE });
+    w.setFinding({ dirty: null, unpushed: null });
+    const ask = await w.hub.worktreeChore({ groupKey: 'A+B' }, 'A', done);
+    expect(ask.action).toBe('needs-confirmation');
+    expect(ask.reasons).toHaveLength(2);
+    expect(await w.hub.worktreeChore({ groupKey: 'A+B' }, 'A', done, true)).toMatchObject({ action: 'sent', text: CLEANUP_ANYWAY });
+    w.setFinding({ dirty: false, unpushed: 0 });
+    expect(await w.hub.worktreeChore({ groupKey: 'A+B' }, 'B', working)).toMatchObject({ action: 'needs-confirmation', reasons: ['the session hasn’t completed its assigned task(s)'] });
+    // TB/UV: needs attention in a group fans the group wording to everyone who needs it, plus the clicker
+    expect(await w.hub.tbuvChore({ groupKey: 'A+B' }, 'A', done)).toEqual({ action: 'sent' });
+    expect(w.sent.at(-1)).toMatchObject({ to: 'A' });
+    expect(w.sent.at(-1)!.text).toContain(TBUV_RESOLUTION_SOLO); // B's latest status does not need attention, so A alone gets the solo wording
+    w.append(b, 'assistant', statusBlock('done', 'tb_uv_cleared: false\n'));
+    await g.pollOnce();
+    await w.hub.tbuvChore({ groupKey: 'A+B' }, 'A', done);
+    expect(w.sent.slice(-2).map((s) => s.to).sort()).toEqual(['A', 'B']);
+    expect(w.sent.at(-1)!.text).toContain(TBUV_RESOLUTION_GROUP);
+    // pending or done: the sign-off sheet, de-duplicated, looked up in the wiki branch ledgers
+    const signoff = await w.hub.tbuvChore({ groupKey: 'A+B' }, 'B', working);
+    expect(signoff.action).toBe('sign-off');
+    expect(signoff.records).toEqual([]);
+    const records = await w.hub.tbuvLookup(done.tbUvRefs, '/r/A');
+    expect(records).toEqual([
+      { id: 'TB-0042', kind: 'tombstone', date: '2026-10-01', claim: 'the old API is gone', supersededBy: undefined },
+      { id: 'UV-0007', kind: 'not-found' },
+    ]);
+    expect(await w.hub.tbuvReview({ groupKey: 'A+B' }, 'A', 'TB-0042', true)).toBe(true);
+    expect(w.sent.at(-1)!.text).toContain('Reviewed TB-0042: confirmed, looks right.');
+    g.cancelAll();
+    await g.settle();
+  });
+
+  it('finds a volunteer, hands the assigned agent’s live thread back, and spawns through the CLI with the settings’ permission mode', async () => {
+    const w = world();
+    const [a, b] = [w.agent('A'), w.agent('B')];
+    w.setRoster([a, b]);
+    await w.hub.refresh();
+    const req = await w.hub.findVolunteer({ title: 'review MR !1364', description: 'three files' });
+    expect(req.requester).toBe('johnny');
+    expect(w.hub.selection).toEqual({ kind: 'volunteer', id: req.id });
+    expect(w.sent).toHaveLength(2);
+    w.append(a, 'assistant', '```cim-volunteer\nvolunteer: yes\ncontext: I touched it\n```');
+    await req.pollOnce();
+    expect(req.volunteers.map((v) => v.sessionID)).toEqual(['A']);
+    expect(await req.assign(a)).toBe(true);
+    expect(w.hub.assigneeAgent(req.id)?.sessionID).toBe('A');
+    expect(w.hub.spawnDefaults('a very long task title that goes on and on and on and on past sixty characters')).toMatchObject({ model: 'claude-opus-5-5', directories: ['/Repos/wiki', '/r/A', '/r/B'] });
+    expect(w.hub.spawnDefaults('x').name).toBe('x');
+    const jobID = await w.hub.spawnAgent({ name: 'fixer', cwd: '/r/A', prompt: 'fix it' });
+    expect(jobID).toBe('beef01');
+    expect(w.runs.find((r) => r[1] === '--bg' && r[3] === 'fixer')).toEqual([process.execPath, '--bg', '--name', 'fixer', '--permission-mode', 'acceptEdits', 'fix it']);
+    w.hub.closeVolunteer(req.id);
+    expect(w.hub.selection).toBeNull();
+    await req.settle();
+  });
+
+  it('the canary hooks and claims ride along', () => {
+    const w = world();
+    const { promptLine } = w.hub.canaryIssue('s1');
+    const id = /canary: (\S+)\./.exec(promptLine)![1];
+    expect(w.hub.canaryGate('s1', { tool_name: 'Bash', tool_input: { command: `agentim ack ${id}` } })).toEqual({ allow: true, acknowledged: true });
+    expect(w.hub.canaryGate('s2', { tool_name: 'Read' })).toEqual({ allow: false, reason: 'no-canary', needsReview: false });
+    expect(w.hub.claim({ agent: 'a', resource: '/wt/x', verb: 'edit', confidence: 1, ttlMs: 1000 }).allowed).toBe(true);
+    expect(w.hub.claim({ agent: 'b', resource: '/wt/x', verb: 'edit', confidence: 1, ttlMs: 1000 }).allowed).toBe(false);
+    expect(w.hub.fleet().agents).toEqual([]);
+  });
+});
+
+describe('the daemon', () => {
+  let d: Daemon | null = null;
+  afterEach(async () => {
+    if (d) await d.close();
+    d = null;
+  });
+  it('serves the pane over loopback and streams events', async () => {
+    const w = world();
+    const [a, b] = [w.agent('A'), w.agent('B')];
+    w.setRoster([a, b]);
+    d = await serve(w.hub, { port: 0, pollMs: 60_000 });
+    const call = async (method: string, path: string, body?: unknown) => {
+      const res = await fetch(d!.url + path, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+      return { status: res.status, json: (await res.json()) as any };
+    };
+    const seen: string[] = [];
+    const ctrl = new AbortController();
+    const stream = fetch(d.url + '/events', { signal: ctrl.signal }).then(async (res) => {
+      const reader = res.body!.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          seen.push(new TextDecoder().decode(value));
+        }
+      } catch {
+        // aborted
+      }
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect((await call('GET', '/health')).json.ok).toBe(true);
+    const state = (await call('GET', '/state')).json;
+    expect(state.roster.agents.map((x: Agent) => x.sessionID)).toEqual(['A', 'B']);
+    expect(state.volunteerRequesterName).toBe('johnny');
+    const selected = await call('POST', '/agents/A/select');
+    expect(selected.json.agent.sessionID).toBe('A');
+    const sent = await call('POST', '/agents/A/message', { text: 'hi' });
+    expect(sent.json.delivered).toBe(true);
+    expect(sent.json.thread.turns.at(-1).text).toBe('hi');
+    expect((await call('POST', '/agents/A/message', { text: '' })).status).toBe(400);
+    expect((await call('GET', '/agents/nope')).status).toBe(404);
+    const group = await call('POST', '/status-check', {});
+    expect(group.json.key).toBe('A+B');
+    expect(group.json.isReviewing).toBe(true);
+    expect((await call('GET', '/groups/A+B')).json.entries).toHaveLength(2);
+    const chip = await call('POST', '/chip', { turnText: statusBlock('done', 'wiki_journaled: true\n') });
+    expect(chip.json.chores).toMatchObject({ wiki: 'done', worktrees: 'needs-attention' });
+    expect((await call('POST', '/agents/A/chore/wiki', { turnText: 'prose' })).status).toBe(400);
+    const vol = await call('POST', '/volunteer', { title: 'docs', description: 'write them' });
+    expect(vol.json.phase).toBe('collecting');
+    expect((await call('GET', '/volunteer')).json).toHaveLength(1);
+    expect((await call('POST', '/pause')).json.resumeSet.paused).toBe(true);
+    expect((await call('POST', '/agents/A/rename', { name: 'Lead' })).json.clipboard).toBe('/rename Lead');
+    expect((await call('GET', '/agents/A')).json.name).toBe('Lead');
+    expect((await call('DELETE', '/volunteer/' + vol.json.id)).json.ok).toBe(true);
+    expect((await call('DELETE', '/groups/A+B')).json.ok).toBe(true);
+    expect((await call('GET', '/nope')).status).toBe(404);
+    await new Promise((r) => setTimeout(r, 30));
+    ctrl.abort();
+    await stream;
+    const text = seen.join('');
+    for (const ev of ['event: roster', 'event: selection', 'event: conversation', 'event: group', 'event: volunteer', 'event: toast']) expect(text).toContain(ev);
+    for (const c of w.hub.conversations.all()) await c.settle();
   });
 });
