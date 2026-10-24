@@ -19,3 +19,4 @@ export * from './archive.js';
 export * from './spawner.js';
 export * from './hub.js';
 export * from './daemon.js';
+export * from './demo.js';
