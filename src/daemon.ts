@@ -233,15 +233,51 @@ function sse(hub: Hub, res: ServerResponse): void {
   });
 }
 
+const LOOPBACK_NAMES = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+/** The Host header names a loopback address, with any port. Blocks DNS rebinding, where an attacker's name resolves to 127.0.0.1. */
+export function isLoopbackHost(host: string | undefined): boolean {
+  if (!host) return false;
+  const h = host.trim().toLowerCase();
+  const name = h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.split(':')[0];
+  return LOOPBACK_NAMES.has(name);
+}
+
+/**
+ * The Origin is this daemon's own: `http://` plus exactly the Host the
+ * request arrived on. A page served from the daemon qualifies; a page on
+ * another site, another local port, `null` (a sandboxed frame) or a browser
+ * extension does not.
+ */
+export function isSameOrigin(origin: string, host: string | undefined): boolean {
+  return isLoopbackHost(host) && origin.trim().toLowerCase() === `http://${host!.trim().toLowerCase()}`;
+}
+
+/** Why a request must be refused, or null. Non-browser clients (the CLI, the hooks) send no Origin and declare JSON, so they pass. */
+export function refusal(req: IncomingMessage): { status: number; error: string } | null {
+  if (!isLoopbackHost(req.headers.host)) return { status: 403, error: 'Host not allowed: this daemon only answers to loopback names.' };
+  const origin = req.headers.origin;
+  if (origin !== undefined && !isSameOrigin(origin, req.headers.host)) return { status: 403, error: 'Origin not allowed: only pages served by this daemon may call it.' };
+  const method = req.method ?? 'GET';
+  if (method !== 'GET' && method !== 'HEAD') {
+    const type = (req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+    // A cross-origin form or fetch can only send text/plain, form-encoded or multipart without a preflight; requiring JSON forces one.
+    if (type !== 'application/json') return { status: 415, error: 'State-changing requests must send Content-Type: application/json.' };
+  }
+  return null;
+}
+
 export function handler(hub: Hub): (req: IncomingMessage, res: ServerResponse) => void {
   const table = routes(hub);
   return async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
-    if (req.method === 'GET' && url.pathname === '/events') return sse(hub, res);
     const send = (status: number, body: unknown) => {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(body, (_k, v) => (v instanceof Map ? Object.fromEntries(v) : v instanceof Set ? [...v] : v)));
     };
+    const refused = refusal(req);
+    if (refused) return send(refused.status, { error: refused.error });
+    if (req.method === 'GET' && url.pathname === '/events') return sse(hub, res);
     try {
       for (const route of table) {
         if (route.method !== req.method) continue;
