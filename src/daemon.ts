@@ -5,6 +5,7 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { Hub, type HubEvent } from './hub.js';
 import { parseStatusReport } from './status-report.js';
@@ -143,7 +144,10 @@ export function routes(hub: Hub): Route[] {
     r('POST', '/groups/:key/review', ({ params, body }) => {
       const g = hub.group(dec(params[0]));
       if (typeof body.isReviewing === 'boolean') g.isReviewing = body.isReviewing;
-      if (typeof body.selection === 'string') g.reviewSelection = body.selection;
+      if (typeof body.selection === 'string') {
+        g.reviewSelection = body.selection;
+        g.reviewSelectionManual = true;
+      }
       return groupView(dec(params[0]));
     }),
     r('POST', '/groups/:key/review/:sid/draft', ({ params, body }) => {
@@ -267,6 +271,34 @@ export function refusal(req: IncomingMessage): { status: number; error: string }
   return null;
 }
 
+const PANEL_DIR = new URL('../panel/', import.meta.url);
+
+/** The panel's three files, by exact path: nothing else is served from disk, so there is no path to traverse. */
+const PANEL_FILES: Record<string, { file: string; type: string }> = {
+  '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
+  '/panel.css': { file: 'panel.css', type: 'text/css; charset=utf-8' },
+  '/panel.js': { file: 'panel.js', type: 'text/javascript; charset=utf-8' },
+};
+
+/** Agent output is untrusted text on this page: no inline script, no foreign loads, no framing. */
+export const PANEL_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+function servePanel(pathname: string, res: ServerResponse): boolean {
+  const entry = PANEL_FILES[pathname];
+  if (!entry) return false;
+  let body: Buffer;
+  try {
+    body = readFileSync(new URL(entry.file, PANEL_DIR));
+  } catch {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: `the panel file ${entry.file} is missing from this install` }));
+    return true;
+  }
+  res.writeHead(200, { 'content-type': entry.type, 'content-security-policy': PANEL_CSP, 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'cache-control': 'no-store' });
+  res.end(body);
+  return true;
+}
+
 export function handler(hub: Hub): (req: IncomingMessage, res: ServerResponse) => void {
   const table = routes(hub);
   return async (req, res) => {
@@ -277,6 +309,7 @@ export function handler(hub: Hub): (req: IncomingMessage, res: ServerResponse) =
     };
     const refused = refusal(req);
     if (refused) return send(refused.status, { error: refused.error });
+    if (req.method === 'GET' && servePanel(url.pathname, res)) return;
     if (req.method === 'GET' && url.pathname === '/events') return sse(hub, res);
     try {
       for (const route of table) {

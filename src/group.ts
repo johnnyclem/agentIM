@@ -57,6 +57,8 @@ export class GroupConversation {
   /** Review mode state (§5.6). */
   isReviewing = false;
   reviewSelection: string | null = null;
+  /** True once a person picked a row (or marked one reviewed): until then the selection follows the ranking. */
+  reviewSelectionManual = false;
   /** sessionID → the id of the latest assistant reply that was marked reviewed. */
   reviewedReplyIDs = new Map<string, string>();
   reviewDrafts = new Map<string, string>();

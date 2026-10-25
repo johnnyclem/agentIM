@@ -185,6 +185,31 @@ describe('the hub', () => {
     await g.settle();
   });
 
+  it('review selection follows the ranking until a person picks a row, and a new status check starts over', async () => {
+    const w = world();
+    const [a, b] = [w.agent('A'), w.agent('B')];
+    w.setRoster([a, b]);
+    await w.hub.refresh();
+    const g = await w.hub.statusCheck();
+    w.append(a, 'assistant', statusBlock('working'));
+    await g.pollOnce();
+    expect(w.hub.review('A+B').selection).toBe('A'); // the only reply so far
+    w.append(b, 'assistant', statusBlock('blocked'));
+    await g.pollOnce();
+    expect(w.hub.review('A+B').entries.map((e) => e.sessionID)).toEqual(['B', 'A']);
+    expect(w.hub.review('A+B').selection).toBe('B'); // the late needs-human reply surfaced on its own
+    g.reviewSelection = 'A';
+    g.reviewSelectionManual = true; // the person picked A
+    expect(w.hub.review('A+B').selection).toBe('A');
+    w.append(b, 'assistant', statusBlock('waiting_for_human'));
+    await g.pollOnce();
+    expect(w.hub.review('A+B').selection).toBe('A'); // a manual pick is not overridden
+    await w.hub.statusCheck();
+    expect(g.reviewSelectionManual).toBe(false);
+    g.cancelAll();
+    await g.settle();
+  });
+
   it('finds a volunteer, hands the assigned agent’s live thread back, and spawns through the CLI with the settings’ permission mode', async () => {
     const w = world();
     const [a, b] = [w.agent('A'), w.agent('B')];
