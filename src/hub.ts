@@ -348,6 +348,7 @@ export class Hub {
       await g.sendStatusCheck();
     }
     g.isReviewing = true;
+    g.reviewSelectionManual = false; // a new round: follow the ranking again
     await this.selectGroup(g.key);
     this.emit({ type: 'group', key: g.key });
     return g;
@@ -363,7 +364,8 @@ export class Hub {
   review(key: string): { entries: ReviewEntry[]; header: ReturnType<typeof reviewHeader>; selection: string | null; rollup: ReturnType<typeof rollup> } {
     const g = this.group(key);
     const entries = computeReviewEntries(g.participants, g.turns, g.awaitingSessionIDs, g.reviewedReplyIDs);
-    g.reviewSelection = repairSelection(entries, g.reviewSelection);
+    // Until a person picks a row, the default is the first unreviewed entry in the current ranking, so a late needs-human reply surfaces on its own.
+    g.reviewSelection = repairSelection(entries, g.reviewSelectionManual ? g.reviewSelection : null);
     return { entries, header: reviewHeader(entries), selection: g.reviewSelection, rollup: rollup([...g.latestReports().values()]) };
   }
 
@@ -376,6 +378,7 @@ export class Hub {
     g.reviewedReplyIDs.set(sessionID, e.latestReplyID);
     const after = computeReviewEntries(g.participants, g.turns, g.awaitingSessionIDs, g.reviewedReplyIDs);
     g.reviewSelection = nextUnreviewed(after, sessionID) ?? sessionID;
+    g.reviewSelectionManual = true;
     this.emit({ type: 'group', key });
     return g.reviewSelection;
   }
