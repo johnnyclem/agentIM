@@ -39,14 +39,17 @@ There is no request/response and no group primitive on the wire. A send is a fir
 | `ledger.ts`, `archive.ts`, `store.ts` | §3.3, §4.4, §4.5 | names, the resume set, in-flight, the archive, the JSON file store |
 | `spawner.ts` | §2.5, §4.6 | the CLI argv builders, `Spawner`, `gitWorktreeChecks` |
 | `hub.ts` | §5.8, §7.4, §9 | the pane's actions: selection, pause, resume, Done, rename, chores, settings |
-| `daemon.ts`, `cli.ts` | | the loopback HTTP API with server-sent events, and the command line |
+| `daemon.ts`, `cli.ts` | | the loopback HTTP API with server-sent events, the guard in front of it, the command line |
+| `panel/` | §5 | the browser panel: `index.html`, `panel.css`, `panel.js`, served by the daemon at `/` |
+| `demo.ts` | | `agentim serve --demo`: fake agents, fake transcripts and canned replies, so the panel can be clicked through with no Claude Code running |
 | `claims.ts`, `canary.ts`, `fleet.ts` | markspace review Items 4 and 5 | intent claims with TTL, the canary gate behind Claude Code hooks, the fleet report |
 
 ## Running it
 
 ```sh
 npm ci && npm run build   # the lockfile matters: a bare `npm install` without it crashes some npm 10.9.x builds in vitest's peer resolution
-agentim serve --repo ~/Repos/instrument            # loopback on 127.0.0.1:7433
+agentim serve --repo ~/Repos/instrument            # loopback on 127.0.0.1:7433; the panel is at http://127.0.0.1:7433/
+agentim serve --demo                               # the same, with fake agents and canned replies
 agentim agents
 agentim send instrument-62 "please rebase onto main"
 agentim status-check                               # asks everyone, opens the group in review mode
@@ -78,6 +81,6 @@ Every socket, subprocess, git and file read is asynchronous and never blocks the
 
 ## What is not here yet
 
-- The panel (§5): header, cards, chat and group columns, review and volunteer views, the sheets. The API above is shaped for it; `GET /state` plus `/events` is the data a view needs.
-- The large-paste hysteresis (§5.4) and the column-width probe (§8.5, §8.6): view-layer concerns.
-- The TB/UV sign-off sheet reads the wiki branch ledgers through `git show wiki:tombstones.jsonl`; adjust `tbuvLookup` if your ledgers live elsewhere.
+- **The macOS pane.** The original is SwiftUI, and there is no Swift toolchain where this was built, so `panel/` is a browser client over the same API: a working reference for the port, and usable on its own. It covers header, cards, 1:1 chat with the model picker, Open in Terminal and Send as me, group threads, status chips and their three chores, review mode, the volunteer flow, pause, resume, Done, rename and the archive (§5.1 to §5.8, §7.4). It is checked in a real browser against the demo hub (screenshots and assertions), and `test/panel.test.ts` covers what it serves and that it never writes agent text through an HTML parser.
+- **Left out of the panel:** the large-paste collapse (§5.4) and the column-width probe and layout guards (§8.5, §8.6), which are SwiftUI-specific; an assignee's live chat embedded in the volunteer view (it is an "Open thread" button); un-marking a reviewed entry (the API only marks).
+- The TB/UV sign-off reads the wiki branch ledgers through `git show wiki:tombstones.jsonl`; adjust `tbuvLookup` if yours live elsewhere.

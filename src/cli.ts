@@ -2,7 +2,7 @@
 /**
  * agentim — the command line over the daemon.
  *
- *   agentim serve [--port N] [--claude PATH] [--repo PATH] [--permission-mode MODE] [--claude-dir DIR] [--state FILE]
+ *   agentim serve [--demo] [--port N] [--claude PATH] [--repo PATH] [--permission-mode MODE] [--claude-dir DIR] [--state FILE]
  *   agentim state | agents
  *   agentim send <agent> <text...>            a message from you, under the human tag
  *   agentim send-as-me <agent> <text...>      restart an idle background job with your text as a real user turn
@@ -21,6 +21,7 @@
 
 import { readFileSync } from 'node:fs';
 import { Hub } from './hub.js';
+import { demoHub } from './demo.js';
 import { serve, DEFAULT_PORT } from './daemon.js';
 import type { Agent } from './agent.js';
 import type { PermissionMode } from './spawner.js';
@@ -88,7 +89,7 @@ async function main(argv: string[]): Promise<void> {
   const one = (k: string) => flags[k]?.[0];
   switch (cmd) {
     case 'serve': {
-      const hub = new Hub({
+      const hub = flags.demo ? demoHub() : new Hub({
         settings: {
           ...(one('claude') ? { claudePath: one('claude') } : {}),
           ...(one('repo') ? { repoPath: one('repo') } : {}),
