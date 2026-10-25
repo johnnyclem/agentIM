@@ -56,6 +56,18 @@ agentim pause && agentim resume
 
 `AGENTIM_URL` points the CLI at another port. Settings (§9) are flags on `serve`: `--claude PATH`, `--repo PATH`, `--permission-mode bypassPermissions|acceptEdits|dontAsk`, `--claude-dir DIR`, `--state FILE`. Persistent state lives in `~/.claude/agentim/state.json`. The canary hooks are in `hooks/settings.example.json`.
 
+## Who can call the daemon
+
+It listens on `127.0.0.1` only and refuses anything that did not come from your own tools:
+
+- the `Host` header must be a loopback name, which blocks DNS rebinding;
+- an `Origin` header, if present, must be this daemon's own (`http://` plus the same host and port), so a web page on any other site, another local port, a sandboxed frame or a browser extension is refused with 403;
+- every request that changes anything must send `Content-Type: application/json`, otherwise 415. A browser cannot send that cross-origin without a preflight, and the daemon sends no CORS headers.
+
+The CLI and the Claude Code hooks send no `Origin` and declare JSON, so they pass. With plain `curl`, add `-H 'Content-Type: application/json'`.
+
+There is no authentication beyond that. Any process on the machine can call the port, and `POST /spawn` starts `claude` with a prompt of the caller's choosing, so on a shared machine treat the port like a shell, or do not run the daemon.
+
 ## The API in one screen
 
 `GET /state` is the whole pane. Then, by area: `/agents/:id/{select,thread,draft,message,send-as-me,instruction,model,terminal,done,rename}`, the chip chores `/agents/:id/chore/{wiki,worktrees,tbuv}` and `/agents/:id/tbuv-review`, `POST /chip` to parse a turn; `/message-all`, `/status-check`, `/groups`, `/groups/:key/{select,draft,message,instruction,status-check,review,tbuv}` and `/groups/:key/review/:sid/{draft,reply,mark-reviewed}`; `/volunteer`, `/volunteer/:id/{select,assign,spawn,listen}`, `/spawn-defaults`, `/spawn`; `/pause`, `/resume`, `/resume/dismiss`, `/archive`, `/archive/:id/restore`; `/claims`, `/canary/*`, `/fleet`; `GET /events` streams `roster`, `selection`, `conversation`, `group`, `volunteer`, `toast`, `claim`, `canary`.
