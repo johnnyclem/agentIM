@@ -45,7 +45,7 @@ There is no request/response and no group primitive on the wire. A send is a fir
 ## Running it
 
 ```sh
-npm install && npm run build
+npm ci && npm run build   # the lockfile matters: a bare `npm install` without it crashes some npm 10.9.x builds in vitest's peer resolution
 agentim serve --repo ~/Repos/instrument            # loopback on 127.0.0.1:7433
 agentim agents
 agentim send instrument-62 "please rebase onto main"
