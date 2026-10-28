@@ -3,6 +3,7 @@
  * agentim — the command line over the daemon.
  *
  *   agentim serve [--demo] [--port N] [--claude PATH] [--repo PATH] [--permission-mode MODE] [--claude-dir DIR] [--state FILE]
+ *                 [--ledger-ref REF] [--ticket-prefix PFX]...
  *   agentim state | agents
  *   agentim send <agent> <text...>            a message from you, under the human tag
  *   agentim send-as-me <agent> <text...>      restart an idle background job with your text as a real user turn
@@ -10,6 +11,9 @@
  *   agentim status-check [agent...]           ask everyone (or these) for a cim-status block; opens review mode
  *   agentim review <group-key>                the review entries
  *   agentim volunteer <title> --description <text> [--requester NAME]
+ *   agentim standup [--date YYYY-MM-DD] [--json]   the morning standup: what moved since the last working day
+ *   agentim lightning start [--repo NAME] [--panel N] | show | abort
+ *   agentim lightning approve <key> <A-D> | reject <key> | defer <key> | skeptics <key>
  *   agentim pause | resume | done <agent> | rename <agent> <name> | terminal <agent> | model <agent> <id>
  *   agentim spawn <name> --cwd DIR --prompt TEXT [--model ID]
  *   agentim ack <canary-id>                   the acknowledgment an agent's first tool call makes
@@ -23,6 +27,7 @@ import { readFileSync } from 'node:fs';
 import { Hub } from './hub.js';
 import { demoHub } from './demo.js';
 import { serve, DEFAULT_PORT } from './daemon.js';
+import { renderStandupText, type Standup } from './standup.js';
 import type { Agent } from './agent.js';
 import type { PermissionMode } from './spawner.js';
 
@@ -96,6 +101,8 @@ async function main(argv: string[]): Promise<void> {
           ...(one('permission-mode') ? { permissionMode: one('permission-mode') as PermissionMode } : {}),
           ...(one('claude-dir') ? { claudeDir: one('claude-dir') } : {}),
           ...(one('state') ? { statePath: one('state') } : {}),
+          ...(one('ledger-ref') ? { ledgerRef: one('ledger-ref') } : {}),
+          ...(flags['ticket-prefix'] ? { ticketPrefixes: flags['ticket-prefix'] } : {}),
         },
       });
       const d = await serve(hub, { port: Number(one('port') ?? DEFAULT_PORT) });
@@ -130,6 +137,19 @@ async function main(argv: string[]): Promise<void> {
     case 'volunteer':
       if (!rest[0] || !one('description')) throw new Error('usage: agentim volunteer <title> --description <text> [--requester NAME]');
       return print(await api('POST', '/volunteer', { title: rest.join(' '), description: one('description'), requester: one('requester') }));
+    case 'standup': {
+      const standup = (await api('POST', '/standup', one('date') ? { covering: one('date') } : {})) as Standup;
+      return flags.json ? print(standup) : void process.stdout.write(renderStandupText(standup) + '\n');
+    }
+    case 'lightning': {
+      const [sub, key, letter] = rest;
+      if (sub === 'start') return print(await api('POST', '/lightning/start', { ...(one('repo') ? { repo: one('repo') } : {}), ...(one('panel') ? { panelSize: Number(one('panel')) } : {}) }));
+      if (sub === 'show') return print(await api('GET', '/lightning'));
+      if (sub === 'abort') return print(await api('POST', '/lightning/abort'));
+      if (sub === 'approve' && key && /^[A-D]$/.test(letter ?? '')) return print(await api('POST', '/lightning/approve', { key, option: letter }));
+      if ((sub === 'reject' || sub === 'defer' || sub === 'skeptics') && key) return print(await api('POST', `/lightning/${sub}`, { key }));
+      throw new Error('usage: agentim lightning start [--repo NAME] [--panel N] | show | abort | approve <key> <A-D> | reject <key> | defer <key> | skeptics <key>');
+    }
     case 'pause':
       return print(await api('POST', '/pause'));
     case 'resume':
@@ -161,7 +181,7 @@ async function main(argv: string[]): Promise<void> {
     case 'hook':
       return hook(rest[0] ?? '');
     default:
-      process.stderr.write('usage: agentim serve | state | agents | send | send-as-me | thread | status-check | review | volunteer | pause | resume | done | rename | terminal | model | spawn | ack | hook\n');
+      process.stderr.write('usage: agentim serve | state | agents | send | send-as-me | thread | status-check | review | volunteer | standup | lightning | pause | resume | done | rename | terminal | model | spawn | ack | hook\n');
       process.exit(cmd ? 1 : 0);
   }
 }

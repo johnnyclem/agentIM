@@ -66,9 +66,17 @@ const S = {
   expanded: new Map(), // turn id -> boolean
   drafts: new Map(), // draft key -> text
   seenToasts: null, // Set once the first snapshot has been taken
-  scroll: new Map(), // transcript key -> { top, atBottom }
+  scroll: new Map(), // scroller key -> { top, atBottom }
   lastSig: '',
   offline: false,
+  // The standup's own UI state. It is not in the snapshot, so a change here calls redraw() to repaint.
+  ui: {
+    lane: null, // the open lane; null until chosen (then: lightning while a round runs, else triage)
+    picked: null, // the picked board item's id
+    picks: new Map(), // lightning item key -> { letter, stamp }: the option picked on its card
+    votesOpen: new Set(), // lightning item keys whose Votes row is expanded
+    busy: new Set(), // keys of actions in flight, so their buttons can be disabled
+  },
 };
 
 function toast(text, kind) {
@@ -85,6 +93,25 @@ async function act(fn) {
     toast(err instanceof Error ? err.message : String(err), 'err');
   } finally {
     await load();
+  }
+}
+
+/** Repaint now, even though the snapshot did not change (UI state moved). */
+function redraw() {
+  S.lastSig = '';
+  render();
+}
+
+/** `act`, but one at a time per key; the key is in S.ui.busy meanwhile so the button that started it can show it. */
+async function guarded(key, fn) {
+  if (S.ui.busy.has(key)) return undefined;
+  S.ui.busy.add(key);
+  redraw();
+  try {
+    return await act(fn);
+  } finally {
+    S.ui.busy.delete(key);
+    redraw();
   }
 }
 
@@ -124,6 +151,10 @@ async function fetchRight(sel) {
     if (sel.kind === 'volunteer') {
       const v = await api('GET', `/volunteer/${enc(sel.id)}`);
       return { kind: 'volunteer', key: `volunteer:${sel.id}`, data: v };
+    }
+    if (sel.kind === 'standup') {
+      const [standup, lightning] = await Promise.all([api('GET', '/standup'), api('GET', '/lightning')]);
+      return { kind: 'standup', key: 'standup', data: { standup, lightning } };
     }
   } catch {
     return null;
@@ -185,21 +216,27 @@ function render() {
   const active = document.activeElement;
   const focusKey = active && active.dataset ? active.dataset.draft : undefined;
   const caret = focusKey !== undefined ? [active.selectionStart, active.selectionEnd] : null;
-  for (const el of document.querySelectorAll('.transcript')) {
+  for (const el of document.querySelectorAll('[data-scroll]')) {
     S.scroll.set(el.dataset.scroll, { top: el.scrollTop, atBottom: el.scrollHeight - el.scrollTop - el.clientHeight < 48 });
   }
   const leftTop = $('#left').scrollTop;
 
   // replaceChildren turns a null argument into the text "null", so empty slots are dropped here, in one place.
   const mount = (el, nodes) => el.replaceChildren(...nodes.filter(Boolean));
+  const standup = S.right && S.right.kind === 'standup';
+  $('main').classList.toggle('standup', !!standup);
+  $('#left').setAttribute('aria-label', standup ? 'Standup' : 'Agents');
   mount($('#header'), renderHeader());
+  mount($('#standup-bar'), standup ? renderStandupBar(S.right.data) : []);
   mount($('#left'), renderLeft());
   mount($('#right'), renderRight());
 
   $('#left').scrollTop = leftTop;
-  for (const el of document.querySelectorAll('.transcript')) {
+  for (const el of document.querySelectorAll('[data-scroll]')) {
     const prev = S.scroll.get(el.dataset.scroll);
-    el.scrollTop = !prev || prev.atBottom ? el.scrollHeight : prev.top;
+    // A transcript follows its bottom; the standup's board and cards (data-top) start at the top.
+    const top = el.dataset.top !== undefined;
+    el.scrollTop = prev && (top || !prev.atBottom) ? prev.top : top ? 0 : el.scrollHeight;
   }
   if (focusKey !== undefined) {
     const el = document.querySelector(`[data-draft="${CSS.escape(focusKey)}"]`);
@@ -230,6 +267,7 @@ function renderHeader() {
       btn('Message All', () => act(() => api('POST', '/message-all')), msgable < 2, 'Open a thread with every agent that has a live inbox (needs two or more)'),
       btn('Status Check', statusCheckSheet, msgable < 1, 'Ask agents for a structured status reply'),
       btn('Find Volunteer', volunteerSheet, msgable < 1, 'Ask who has context on a task'),
+      btn('Morning Standup', () => guarded('standup', () => api('POST', '/standup')), S.ui.busy.has('standup'), 'Build the standup from local git, the ledgers and the sessions. Nothing is sent to an agent'),
       btn('New Group', newGroupSheet, msgable < 2, 'A shared thread with chosen agents'),
       btn('Pause Agents', () => act(() => api('POST', '/pause')), running === 0 || snap.flags.isPausing, 'Ask every running agent to stop at a safe point'),
       btn(resumeN ? `Resume Agents (${resumeN})` : 'Resume Agents', () => act(() => api('POST', '/resume')), !resumeN || snap.flags.isResuming, 'Bring back the paused or stopped agents'),
@@ -242,6 +280,7 @@ function renderHeader() {
 
 function renderLeft() {
   const snap = S.snap;
+  if (S.right && S.right.kind === 'standup') return [renderStandupNav(S.right.data)];
   const out = [];
   if (snap.roster.hasLoaded && snap.resumeSet) {
     const rs = snap.resumeSet;
@@ -385,6 +424,7 @@ function renderRight() {
   if (!r) return [h('div', { class: 'pane-empty' }, h('div', { class: 'big', text: 'Pick an agent' }), h('div', { text: 'Its session log loads here, and anything you send lands in its live prompt box.' }))];
   if (r.kind === 'agent') return renderChat(r.data, r.key);
   if (r.kind === 'group') return renderGroup(r.data, r.key);
+  if (r.kind === 'standup') return renderStandupRight(r.data);
   return renderVolunteer(r.data, r.key);
 }
 
@@ -728,6 +768,360 @@ function renderVolunteer(v) {
   return [h('div', { class: 'vol' }, parts)];
 }
 
+// ---- morning standup and lightning round ----------------------------------------------------------------------------------------
+
+const LANES = [
+  ['triage', 'Triage'],
+  ['agents', 'Agents'],
+  ['lightning', 'Lightning'],
+];
+const VERBS = { confirm: 'Confirm', deny: 'Deny', challenge: 'Challenge', no_change: 'No change' };
+const VOTE_TINT = { concur: 'green', concern: 'amber', refuted: 'red' };
+const BOARD_TINTS = new Set(['blue', 'grey', 'amber', 'red', 'green']);
+const boardTint = (t) => (BOARD_TINTS.has(t) ? t : 'grey');
+const isOpenPhase = (phase) => phase === 'presented' || phase === 'fallback';
+const isSettled = (phase) => phase === 'decided' || phase === 'deferred';
+const verbOf = (verb) => VERBS[verb] || verb;
+const sentence = (s) => (s || '').replace(/_/g, ' ');
+
+/** 'A', 'A or B', 'A, B or C'. */
+const orList = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} or ${xs[xs.length - 1]}`);
+
+const localDay = (ms) => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+const laneOf = (d) => S.ui.lane || (d.lightning.active ? 'lightning' : 'triage');
+const roundStarted = (round) => round.active || round.items.length > 0;
+
+/**
+ * What the Lightning lane's right pane shows. A board row that is not in the round shows its own fields (the round cannot say anything
+ * about it); otherwise, with a round, the card follows the round's current item.
+ */
+function lightningFocus(d) {
+  const { standup, lightning: round } = d;
+  const picked = standup.board.find((i) => i.lane === 'lightning' && i.id === S.ui.picked);
+  if (picked && !round.items.some((i) => i.key === picked.rowKey)) return { kind: 'row', board: picked };
+  if (roundStarted(round)) return { kind: 'card', item: round.items.find((i) => i.key === round.current) || null };
+  return { kind: 'none' };
+}
+
+function setLane(lane) {
+  S.ui.lane = lane;
+  S.ui.picked = null;
+  redraw();
+}
+
+/** A board row was clicked. In a round, a Lightning row becomes the current card (which asks an agent to present it if it has not been). */
+function pickBoard(item, round) {
+  S.ui.picked = item.id;
+  redraw();
+  if (item.lane === 'lightning' && round.items.some((i) => i.key === item.rowKey)) act(() => api('POST', '/lightning/select', { key: item.rowKey }));
+}
+
+const startLightning = (d, keys) =>
+  guarded('start', async () => {
+    S.ui.lane = 'lightning';
+    S.ui.picked = null;
+    await api('POST', '/lightning/start', { keys: keys || d.standup.board.filter((i) => i.lane === 'lightning').map((i) => i.rowKey) });
+  });
+
+// ---- the standup band and the navigator ----
+
+function renderStandupBar({ standup: s, lightning: round }) {
+  const covering = s.through === s.covering ? s.covering : `${s.covering} - ${s.through}`;
+  const source = (c) => h('span', { class: 'pill green src', title: c.note }, `${c.label} ${c.count}`, c.note ? h('span', { class: 'mark', text: '!', role: 'img', 'aria-label': `Note: ${c.note}` }) : null);
+  return [
+    h(
+      'div',
+      { class: 'sb-main' },
+      h('div', { class: 'sb-title' }, h('h2', { text: 'Morning Standup' }), h('span', { class: 'sb-sub', text: `covering ${covering}, run ${s.run}` })),
+      h('div', { class: 'srcs' }, s.sources.map(source))
+    ),
+    h(
+      'div',
+      { class: 'sb-actions' },
+      round.active ? h('button', { class: 'btn small', text: 'Abort', title: 'Stop the Lightning round. Decisions already made are kept', onclick: () => act(() => api('POST', '/lightning/abort')) }) : null,
+      h('button', { class: 'btn small', text: 'Back to agents', onclick: () => act(() => api('POST', '/selection/clear')) })
+    ),
+  ];
+}
+
+function renderStandupNav(d) {
+  const { standup: s, lightning: round } = d;
+  const lane = laneOf(d);
+  const items = s.board.filter((i) => i.lane === lane);
+  const phases = new Map(round.items.map((i) => [i.key, i.phase]));
+  let shown = S.ui.picked;
+  if (lane === 'lightning') {
+    const focus = lightningFocus(d);
+    shown = focus.kind === 'row' ? focus.board.id : focus.kind === 'card' && focus.item ? focus.item.key : null;
+  }
+  const c = round.counts;
+  const lanes = h(
+    'div',
+    { class: 'lanes', role: 'radiogroup', 'aria-label': 'Lane' },
+    LANES.map(([id, label]) =>
+      h('button', { class: 'lane' + (id === lane ? ' on' : ''), role: 'radio', 'aria-checked': id === lane ? 'true' : 'false', onclick: () => setLane(id) }, h('span', { class: 'radio' }), h('span', { class: 'nm', text: label }), h('span', { class: 'count', text: String(s.lanes[id]) }))
+    )
+  );
+  const start =
+    lane === 'lightning'
+      ? h(
+          'div',
+          { class: 'lstart' },
+          h('button', { class: 'btn primary', text: 'Start Lightning', disabled: items.length === 0 || S.ui.busy.has('start'), title: 'Settle this lane one card at a time. Asks an agent in each row’s repo to present it. A round that is running is replaced', onclick: () => startLightning(d) }),
+          roundStarted(round) ? h('span', { class: 'muted small', text: `${c.remaining} of ${c.total} left${c.decided ? `, ${c.decided} decided` : ''}${c.deferred ? `, ${c.deferred} deferred` : ''}${round.active ? '' : ', stopped'}` }) : null
+        )
+      : null;
+  const row = (item) =>
+    h(
+      'button',
+      { class: 'board-row' + (item.id === shown ? ' on' : '') + (isSettled(phases.get(item.rowKey)) ? ' done' : ''), 'data-board': item.id, 'aria-pressed': item.id === shown ? 'true' : 'false', title: `${item.title}${item.repo ? ` (${item.repo})` : ''}`, onclick: () => pickBoard(item, round) },
+      h('span', { class: 'tdot ' + boardTint(item.tint), 'aria-hidden': 'true' }),
+      h('span', { class: 't' }, item.title, item.repo && lane !== 'lightning' ? h('span', { class: 'repo', text: ` (${item.repo})` }) : null)
+    );
+  return h('div', { class: 'nav' }, lanes, start, h('div', { class: 'board-head', text: 'Board' }), h('div', { class: 'board', 'data-scroll': `board:${lane}`, 'data-top': '' }, items.length ? items.map(row) : h('div', { class: 'muted small', text: 'Nothing in this lane.' })));
+}
+
+// ---- the right pane ----
+
+const ASK_PICK = {
+  triage: ['Pick a branch', 'Its ticket keys and the sessions working on it show here.'],
+  agents: ['Pick a session', 'Its last status shows here, with a button to open its thread.'],
+  lightning: ['Settle the open ledger rows', 'Start Lightning to go through this lane one card at a time, or pick a row to look at it.'],
+};
+
+function renderStandupRight(d) {
+  const lane = laneOf(d);
+  if (lane === 'lightning') {
+    const focus = lightningFocus(d);
+    if (focus.kind === 'card') return [cardView(d.lightning, focus.item)];
+    if (focus.kind === 'row') return [detailView(focus.board, d)];
+  } else {
+    const picked = d.standup.board.find((i) => i.lane === lane && i.id === S.ui.picked);
+    if (picked) return [detailView(picked, d)];
+  }
+  return [h('div', { class: 'pane-empty' }, h('div', { class: 'big', text: ASK_PICK[lane][0] }), h('div', { text: ASK_PICK[lane][1] }))];
+}
+
+/** A list of label/value rows; an empty value leaves its row out. */
+function fieldList(rows) {
+  const shown = rows.filter(([, v]) => v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && v.length === 0));
+  return h('dl', { class: 'fields' }, shown.flatMap(([k, v]) => [h('dt', { text: k }), h('dd', null, v)]));
+}
+
+const roundLog = (round) => (round.log.length ? h('div', { class: 'rlog', role: 'log', 'aria-label': 'Round log' }, round.log.map((line) => h('div', { text: line }))) : null);
+
+/** A board item that has no card: a branch, a session, or a ledger row that is not in the round. */
+function detailView(item, d) {
+  const round = d.lightning;
+  const roster = S.snap.roster.agents;
+  const sessionID = item.lane === 'agents' ? item.id.slice('session:'.length) : null;
+  const agent = sessionID ? roster.find((a) => a.sessionID === sessionID) : null;
+  const openThread = (id) => act(() => api('POST', `/agents/${enc(id)}/select`));
+  const joined = (item.sessionIDs || []).map((id) => {
+    const a = roster.find((x) => x.sessionID === id);
+    return a ? h('button', { class: 'link', text: a.name, title: `Open the thread with ${a.name}`, onclick: () => openThread(id) }) : h('span', { class: 'mono small', text: id.slice(0, 8) });
+  });
+  const rows = {
+    triage: [['Repo', item.repo], ['Detail', item.detail], ['Ticket keys', item.refs.length ? item.refs.join(', ') : null], ['Last commit', item.at ? ago(item.at) : null], ['Sessions', joined.length ? h('span', { class: 'links' }, joined) : 'None on this branch'], ['From', item.sources.join(', ')]],
+    agents: [['Repo', item.repo], ['Last scope', item.detail], ['Ticket keys', item.refs.length ? item.refs.join(', ') : null], ['Last activity', item.at ? ago(item.at) : null], ['Directory', agent && h('span', { class: 'mono', text: agent.cwd })], ['Session', sessionID && h('span', { class: 'mono', text: sessionID.slice(0, 8), title: sessionID })]],
+    lightning: [['Repo', item.repo], ['Doubt', item.detail], ['Opened', item.at ? localDay(item.at) : null], ['Key', h('span', { class: 'mono', text: item.id })]],
+  }[item.lane];
+  const actions =
+    item.lane === 'agents'
+      ? h('button', { class: 'btn primary', text: 'Open thread', disabled: !agent, title: agent ? 'Back to the normal view with this session selected' : 'This session is not in the roster', onclick: () => openThread(sessionID) })
+      : item.lane === 'lightning'
+        ? h('button', { class: 'btn', text: 'Present this one', disabled: S.ui.busy.has('start'), title: 'Start a round with just this row. A round that is running is replaced', onclick: () => startLightning(d, [item.rowKey]) })
+        : null;
+  return h(
+    'div',
+    { class: 'cardview', 'data-scroll': `item:${item.id}`, 'data-top': '' },
+    h(
+      'div',
+      { class: 'lcard' },
+      h('div', { class: 'tags' }, h('span', { class: 'badge ' + boardTint(item.tint), text: sentence(item.state) })),
+      h('div', { class: 'ltitle', text: item.title }),
+      fieldList(rows),
+      actions
+    ),
+    roundStarted(round) ? roundLog(round) : null
+  );
+}
+
+const pickStamp = (p) => `${p.source}:${p.presentedBy}`;
+
+/** The letter picked on this card, if it is still one of the options of the presentation that is on screen. */
+function pickedLetter(item) {
+  const rec = S.ui.picks.get(item.key);
+  const p = item.presentation;
+  return rec && p && rec.stamp === pickStamp(p) && p.options.some((o) => o.letter === rec.letter) ? rec.letter : null;
+}
+
+function choose(item, letter) {
+  S.ui.picks.set(item.key, { letter, stamp: pickStamp(item.presentation) });
+  redraw();
+}
+
+/** The card for the round's current item; null means the queue is empty. */
+function cardView(round, item) {
+  const c = round.counts;
+  const body = item
+    ? lightningCard(round, item)
+    : h('div', { class: 'lcard' }, h('div', { class: 'ltitle', text: 'Nothing left to settle.' }), h('div', { class: 'muted small', text: `${c.decided} decided, ${c.deferred} deferred.` }));
+  return h('div', { class: 'cardview', 'data-scroll': `card:${item ? item.key : ''}`, 'data-top': '' }, body, roundLog(round));
+}
+
+function tagPills(p) {
+  const tag = (text, tint) => h('span', { class: 'pill' + (tint ? ` ${tint}` : ''), text });
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  return [p.needs ? tag(`Needs${cap(p.needs)}`, p.needs === 'human' ? 'amber' : '') : null, p.nature ? tag(p.nature) : null, p.checkable ? tag(`checkable ${p.checkable}`, p.checkable === 'now' ? 'green' : '') : null];
+}
+
+/** `path:lines`, and `@sha` when the agent pinned one: the cite without its quote. */
+const citeText = (c) => `${c.path}:${c.startLine === c.endLine ? c.startLine : `${c.startLine}-${c.endLine}`}${c.sha ? `@${c.sha}` : ''}`;
+
+function evidenceRow(e) {
+  const g = e.grounding;
+  const grounded = g.status === 'grounded';
+  return h(
+    'li',
+    { class: 'ev', 'data-evidence': String(e.n) },
+    h('span', { class: 'n muted', text: String(e.n) }),
+    h('span', { class: 'pill ' + (grounded ? 'green' : 'red'), text: grounded ? `grounded${g.sha ? ` @${g.sha}` : ''}` : 'UNGROUNDED', title: grounded ? null : g.reason }),
+    h('span', { class: 'cite mono', text: e.cite ? citeText(e.cite) : e.raw }),
+    e.cite && e.cite.quote ? h('span', { class: 'quote muted', text: `“${e.cite.quote}”` }) : null
+  );
+}
+
+function optionRow(item, o, picked, enabled) {
+  const grounded = o.grounding === 'grounded';
+  const chosen = picked === o.letter || (item.decision && item.decision.option === o.letter);
+  return h(
+    'li',
+    { class: 'opt' + (chosen ? ' on' : '') + (enabled ? ' live' : ''), 'data-option': o.letter, onclick: enabled ? () => choose(item, o.letter) : null },
+    h('button', { class: 'letter', text: o.letter, disabled: !enabled, 'aria-pressed': picked === o.letter ? 'true' : 'false', 'aria-label': `Option ${o.letter}: ${verbOf(o.verb)}, ${o.title}` }),
+    h(
+      'div',
+      { class: 'obody' },
+      h('div', { class: 'ohead', text: `${verbOf(o.verb)}: ${o.title}` }),
+      h(
+        'div',
+        { class: 'owhy' },
+        h('span', { class: 'pill ' + (grounded ? 'green' : 'red'), text: grounded ? 'grounded' : 'UNGROUNDED', title: grounded ? `Cites ${o.cites.join(', ')}` : o.cites.length ? 'None of the cites this option references is grounded' : 'This option cites no evidence of its own' }),
+        ' ',
+        o.why,
+        o.cites.length ? h('span', { class: 'muted', text: ` (cites ${o.cites.join(', ')})` }) : null
+      )
+    )
+  );
+}
+
+/** The collapsible Votes row. Its open state is S.ui.votesOpen, so a repaint keeps it. */
+function votesRow(round, item, open) {
+  const v = item.votes;
+  const t = v.tally;
+  const busy = S.ui.busy.has(`skeptics:${item.key}`);
+  const entry = (e) =>
+    h(
+      'li',
+      { class: 'vote', 'data-vote': e.sessionID },
+      h('span', { class: 'vname', text: e.name }),
+      h('span', { class: 'pill ' + (VOTE_TINT[e.vote] || ''), text: e.vote || 'silent' }),
+      e.vote ? h('span', { class: 'muted small', text: e.prefers ? `prefers ${e.prefers}` : 'no preference' }) : null,
+      e.reason ? h('span', { class: 'vreason', text: e.reason }) : null
+    );
+  return h(
+    'div',
+    { class: 'votes' },
+    h(
+      'details',
+      { open: S.ui.votesOpen.has(item.key), ontoggle: (e) => (e.target.open ? S.ui.votesOpen.add(item.key) : S.ui.votesOpen.delete(item.key)) },
+      h('summary', { text: v.asked ? `Votes: ${t.concur} concur, ${t.concern} concern, ${t.refuted} refuted, ${t.silent} silent` : 'Votes: not asked' }),
+      v.asked ? h('ul', { class: 'vlist' }, v.entries.map(entry)) : h('div', { class: 'muted small', text: `Nobody has been asked. Ask skeptics sends this card to up to ${round.panelSize} other agents and asks them to vote.` })
+    ),
+    !v.asked && open ? h('button', { class: 'btn small', text: 'Ask skeptics', disabled: busy, title: `Send this card to up to ${round.panelSize} other agents and ask them to vote`, onclick: () => guarded(`skeptics:${item.key}`, () => api('POST', '/lightning/skeptics', { key: item.key })) }) : null
+  );
+}
+
+/** The next card still to settle after this one, in queue order, wrapping round. */
+function nextLiveKey(round, item) {
+  const at = round.items.findIndex((i) => i.key === item.key);
+  for (let k = 1; k < round.items.length; k++) {
+    const other = round.items[(at + k) % round.items.length];
+    if (!isSettled(other.phase)) return other.key;
+  }
+  return null;
+}
+
+/** Approve one option. A relay that failed is not a thrown error: the engine logged why, and that line is the toast. */
+function approve(item, letter) {
+  const p = item.presentation;
+  const option = p.options.find((o) => o.letter === letter);
+  const before = S.right.data.lightning.log;
+  return guarded(item.key, async () => {
+    const r = await api('POST', '/lightning/approve', { key: item.key, option: letter });
+    if (!r.decided) {
+      const last = r.view.log[r.view.log.length - 1];
+      toast(last && last !== before[before.length - 1] ? last : 'The decision was not recorded.', 'err');
+    } else if (r.delivered) toast(`Sent option ${letter} (${verbOf(option.verb)}) to ${p.source === 'agent' ? p.presentedBy : `an agent in ${item.repo}`}.`);
+  });
+}
+
+function lightningCard(round, item) {
+  const p = item.presentation;
+  const open = isOpenPhase(item.phase);
+  const busy = S.ui.busy.has(item.key);
+  const picked = pickedLetter(item);
+  const post = (path) => () => guarded(item.key, () => api('POST', path, { key: item.key }));
+  const head = [h('div', { class: 'tags' }, p ? tagPills(p) : null), h('div', { class: 'ltitle', text: item.title, title: item.title }), h('div', { class: 'lsummary', text: item.summary, title: item.summary })];
+  const deferBtn = h('button', { class: 'btn', text: 'Defer', disabled: busy, title: 'Hide this row until tomorrow', onclick: post('/lightning/defer') });
+  const next = nextLiveKey(round, item);
+  const nextBtn = next ? h('button', { class: 'btn', text: 'Next', title: 'Go to the next card still to settle', onclick: () => act(() => api('POST', '/lightning/select', { key: next })) }) : null;
+
+  if (!p) {
+    const live = round.active && !isSettled(item.phase);
+    const waiting = item.phase === 'deferred' ? 'Deferred until tomorrow.' : !round.active ? 'This round was stopped before the card was presented.' : item.phase === 'presenting' ? `Asking an agent in ${item.repo}…` : 'Waiting for its turn…';
+    const row = item.row;
+    const rowFields = fieldList([['Opened', row.date], ['Raised by', row.raisedBy], ['Status', row.status], ['Claim', row.claim], ['Doubt', row.doubt], ['Settles it', row.settlesIt], ['Superseded by', row.supersededBy]]);
+    return h('div', { class: 'lcard', 'data-phase': item.phase }, head, h('div', { class: 'lhint' }, live ? h('span', { class: 'spin' }) : null, ' ', waiting), rowFields, isSettled(item.phase) ? h('div', { class: 'lactions' }, nextBtn) : live ? h('div', { class: 'lactions' }, deferBtn) : null);
+  }
+
+  const optionsLive = open && !busy;
+  const chosen = picked && p.options.find((o) => o.letter === picked);
+  const relay = (o) => (o.verb === 'no_change' ? `Approve records option ${o.letter} and sends nothing.` : `Approve sends option ${o.letter} (${verbOf(o.verb)}) to ${p.source === 'agent' ? p.presentedBy : `an agent in ${item.repo}`}.`);
+  let foot;
+  if (item.phase === 'decided') foot = [h('div', { class: 'lhint strong', text: `Decided: option ${item.decision.option} (${verbOf(item.decision.verb)})` }), h('div', { class: 'lactions' }, nextBtn)];
+  else if (item.phase === 'deferred') foot = [h('div', { class: 'lhint strong', text: 'Deferred until tomorrow.' }), h('div', { class: 'lactions' }, nextBtn)];
+  else if (!open) foot = [h('div', { class: 'lactions' }, deferBtn)];
+  else
+    foot = [
+      h('div', { class: 'lhint', text: chosen ? relay(chosen) : `Pick ${orList(p.options.map((o) => o.letter))} to approve.` }),
+      h(
+        'div',
+        { class: 'lactions' },
+        h('button', { class: 'btn primary', text: 'Approve', disabled: !picked || busy, title: picked ? 'Relay the picked option to the agent' : 'Pick an option first', onclick: () => approve(item, picked) }),
+        h('button', { class: 'btn', text: 'Reject', disabled: busy, title: 'None of these: ask again later with a different presenter', onclick: post('/lightning/reject') }),
+        deferBtn
+      ),
+    ];
+
+  return h(
+    'div',
+    { class: 'lcard', 'data-phase': item.phase },
+    head,
+    h('div', { class: 'lby muted', text: p.source === 'ledger' ? (p.presentedBy ? `Presented by ${p.presentedBy} (from the ledger row)` : 'Presented from the ledger row') : `Presented by ${p.presentedBy}` }),
+    p.claim ? h('div', { class: 'lclaim', text: p.claim }) : null,
+    p.assessment ? h('div', { class: 'lassess', text: p.assessment }) : null,
+    p.evidence.length ? h('ul', { class: 'evidence', 'aria-label': 'Evidence' }, p.evidence.map(evidenceRow)) : null,
+    h('ul', { class: 'options', 'aria-label': 'Options' }, p.options.map((o) => optionRow(item, o, picked, optionsLive))),
+    votesRow(round, item, open),
+    foot
+  );
+}
+
 // ---- sheets ---------------------------------------------------------------------------------------------------------------------
 
 function openSheet(title, body, actions) {
@@ -861,6 +1255,35 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+/** The Lightning card that is on screen and open for a decision, or null. */
+function openCard() {
+  const d = S.right && S.right.kind === 'standup' ? S.right.data : null;
+  if (!d || laneOf(d) !== 'lightning') return null;
+  const focus = lightningFocus(d);
+  return focus.kind === 'card' && focus.item && focus.item.presentation && isOpenPhase(focus.item.phase) ? focus.item : null;
+}
+
+// A-D pick an option and Enter approves it. A field, a button or a modifier key means the person is doing something else.
+document.addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.repeat || e.defaultPrevented) return;
+  const focus = document.activeElement;
+  if (focus && ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SUMMARY'].includes(focus.tagName)) return;
+  if (document.querySelector('dialog[open]')) return;
+  const item = openCard();
+  if (!item) return;
+  const letter = (e.key || '').length === 1 ? e.key.toUpperCase() : '';
+  if (item.presentation.options.some((o) => o.letter === letter)) {
+    e.preventDefault();
+    if (!S.ui.busy.has(item.key)) choose(item, letter);
+  } else if (e.key === 'Enter') {
+    const picked = pickedLetter(item);
+    if (picked && !S.ui.busy.has(item.key)) {
+      e.preventDefault();
+      approve(item, picked);
+    }
+  }
+});
+
 let timer = null;
 const schedule = () => {
   clearTimeout(timer);
@@ -868,7 +1291,7 @@ const schedule = () => {
 };
 try {
   const es = new EventSource('/events');
-  for (const type of ['roster', 'selection', 'conversation', 'group', 'volunteer', 'toast', 'claim', 'canary']) es.addEventListener(type, schedule);
+  for (const type of ['roster', 'selection', 'conversation', 'group', 'volunteer', 'toast', 'claim', 'canary', 'standup', 'lightning']) es.addEventListener(type, schedule);
 } catch {
   /* polling below still works */
 }

@@ -10,6 +10,7 @@ import type { AddressInfo } from 'node:net';
 import { Hub, type HubEvent } from './hub.js';
 import { parseStatusReport } from './status-report.js';
 import { terminalTooltip } from './spawner.js';
+import type { Letter } from './lightning-format.js';
 
 export const DEFAULT_PORT = 7433;
 
@@ -48,6 +49,22 @@ function str(body: Record<string, unknown>, key: string, required = true): strin
 }
 
 const strList = (body: Record<string, unknown>, key: string): string[] | undefined => (Array.isArray(body[key]) ? (body[key] as unknown[]).map(String) : undefined);
+
+/** A string field that may be left out; present but not a string is a 400, never silently ignored. A blank one reads as left out. */
+function optStr(body: Record<string, unknown>, key: string): string | undefined {
+  const v = body[key];
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string') throw new HttpError(400, `${key} is a string`);
+  return v.trim() === '' ? undefined : v;
+}
+
+/** The Lightning Round's start options, checked: a wrong type is a 400, not a round over the wrong rows. */
+function lightningOptions(body: Record<string, unknown>): { keys?: string[]; repo?: string; panelSize?: number } {
+  const { keys, panelSize } = body;
+  if (keys !== undefined && !(Array.isArray(keys) && keys.every((k) => typeof k === 'string'))) throw new HttpError(400, 'keys is an array of strings');
+  if (panelSize !== undefined && !(typeof panelSize === 'number' && Number.isInteger(panelSize) && panelSize >= 0 && panelSize <= 12)) throw new HttpError(400, 'panelSize is a whole number from 0 to 12');
+  return { keys: keys as string[] | undefined, repo: optStr(body, 'repo'), panelSize: panelSize as number | undefined };
+}
 
 const report = (body: Record<string, unknown>): ReturnType<typeof parseStatusReport> => {
   const r = parseStatusReport(str(body, 'turnText'));
@@ -223,6 +240,23 @@ export function routes(hub: Hub): Route[] {
       return { ok: true };
     }),
     r('GET', '/fleet', () => hub.fleet()),
+    r('GET', '/standup', () => hub.standup ?? raise(404, 'No standup yet; POST /standup first.')),
+    r('POST', '/standup', ({ body }) => hub.buildStandup(optStr(body, 'covering'))),
+    r('GET', '/lightning', () => hub.lightningView()),
+    r('POST', '/lightning/start', ({ body }) => hub.lightningStart(lightningOptions(body))),
+    r('POST', '/lightning/select', ({ body }) => hub.lightningSelect(str(body, 'key'))),
+    r('POST', '/lightning/approve', async ({ body }) => {
+      const option = str(body, 'option');
+      if (!/^[A-D]$/.test(option)) throw new HttpError(400, 'option is one of A, B, C, D');
+      return hub.lightningApprove(str(body, 'key'), option as Letter);
+    }),
+    r('POST', '/lightning/reject', ({ body }) => hub.lightningReject(str(body, 'key'))),
+    r('POST', '/lightning/defer', ({ body }) => hub.lightningDefer(str(body, 'key'))),
+    r('POST', '/lightning/skeptics', ({ body }) => hub.lightningSkeptics(str(body, 'key'))),
+    r('POST', '/lightning/abort', () => {
+      hub.lightningAbort();
+      return { ok: true };
+    }),
   ];
 }
 
@@ -322,7 +356,11 @@ export function handler(hub: Hub): (req: IncomingMessage, res: ServerResponse) =
       return send(404, { error: `no route ${req.method} ${url.pathname}` });
     } catch (err) {
       if (err instanceof HttpError) return send(err.status, { error: err.message });
-      return send(err instanceof Error && /^No |no such|not a participant/.test(err.message) ? 404 : 500, { error: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      // A bad date or a letter the card does not offer is the caller's mistake; an unknown thing is a 404.
+      const bad = /^covering must be|^Option [A-D] is not offered/.test(message);
+      const missing = err instanceof Error && /^No |no such|not a participant/.test(message);
+      return send(bad ? 400 : missing ? 404 : 500, { error: message });
     }
   };
 }

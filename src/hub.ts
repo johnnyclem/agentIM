@@ -3,14 +3,15 @@
  * §7.4, §9). It owns one instance each of the roster poller, the
  * conversation store, the group store, the volunteer requests, the archive
  * and the ledger, plus the harness extras from the markspace review
- * (claims, the canary gate). The HTTP layer in daemon.ts is a thin
+ * (claims, the canary gate), and the Morning Standup and the Lightning
+ * Round (standup spec §6.4). The HTTP layer in daemon.ts is a thin
  * translation; every collaborator is injectable so tests drive the hub
  * with a fake clock and no sockets.
  */
 
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { type Agent, isMessageable, isStopped, shortID, projectName } from './agent.js';
 import { CLAUDE_DIR, readTail, readSince, transcriptPath, type TranscriptRead } from './transcript.js';
 import { runCommand, failureText, type Runner } from './runner.js';
@@ -22,6 +23,10 @@ import { computeReviewEntries, nextUnreviewed, repairSelection, reviewHeader, ty
 import { VolunteerRequest } from './volunteer.js';
 import { SessionLedger } from './ledger.js';
 import { Archive } from './archive.js';
+import { buildStandup as buildBoard, orderLightningRows, type SessionActivity, type Standup } from './standup.js';
+import { DecisionStore, LightningRound, type ApproveResult, type LightningView } from './lightning.js';
+import { DEFAULT_LEDGER_REF, discoverRepos, readLedger, type LedgerRow, type RepoRef } from './tbuv-ledger.js';
+import type { Letter } from './lightning-format.js';
 import { JsonFileKV, KEYS, type KV } from './store.js';
 import { Spawner, resolveClaude, processAlive, gitWorktreeChecks, terminalTooltip, type PermissionMode } from './spawner.js';
 import { WRAP_UP, pauseMessage, resumeMessage, renameNotice, JOURNAL_NOW, JOURNAL_INCOMPLETE, CLEANUP_SAFE, CLEANUP_ANYWAY, tbuvReviewed } from './prompts.js';
@@ -45,6 +50,10 @@ export interface Settings {
   modelPresets: ModelPreset[];
   claudeDir: string;
   statePath: string;
+  /** The branch the TB/UV ledger files live on. */
+  ledgerRef: string;
+  /** Prefixes whose unhyphenated form in a branch or session name (`qp27153`) is a ticket key (QP-27153). */
+  ticketPrefixes: string[];
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -59,7 +68,17 @@ export const DEFAULT_SETTINGS: Settings = {
   ],
   claudeDir: CLAUDE_DIR,
   statePath: join(CLAUDE_DIR, 'agentim', 'state.json'),
+  ledgerRef: DEFAULT_LEDGER_REF,
+  ticketPrefixes: [],
 };
+
+/** Timing knobs of the Lightning Round; the engine's own defaults apply to what is left out (the demo shortens them). */
+export interface LightningTiming {
+  presentTimeoutMs?: number;
+  voteTimeoutMs?: number;
+  pollMs?: number;
+  maxPresenters?: number;
+}
 
 export interface HubDeps {
   settings?: Partial<Settings>;
@@ -76,9 +95,10 @@ export interface HubDeps {
   writeScript?: (content: string) => Promise<string>;
   openFile?: (path: string) => Promise<void>;
   osUserName?: string;
+  lightningTiming?: LightningTiming;
 }
 
-export type Selection = { kind: 'agent'; sessionID: string } | { kind: 'group'; key: string } | { kind: 'volunteer'; id: string } | null;
+export type Selection = { kind: 'agent'; sessionID: string } | { kind: 'group'; key: string } | { kind: 'volunteer'; id: string } | { kind: 'standup' } | null;
 
 export interface Toast {
   id: string;
@@ -93,6 +113,8 @@ export type HubEvent =
   | { type: 'conversation'; sessionID: string }
   | { type: 'group'; key: string }
   | { type: 'volunteer'; id: string }
+  | { type: 'standup' }
+  | { type: 'lightning' }
   | { type: 'selection'; selection: Selection }
   | { type: 'toast'; toast: Toast }
   | { type: 'claim'; verdict: Verdict }
@@ -121,6 +143,12 @@ export interface TbUvRecord {
 
 const sleepReal = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** At most this many distinct directories are asked which repo they belong to. */
+const MAX_REPO_DIRS = 200;
+
+/** What GET /lightning says before any round was started. */
+const emptyLightning = (): LightningView => ({ active: false, current: null, panelSize: 4, items: [], counts: { total: 0, remaining: 0, decided: 0, deferred: 0 }, log: [] });
+
 export class Hub {
   readonly settings: Settings;
   readonly kv: KV;
@@ -134,6 +162,11 @@ export class Hub {
   readonly volunteers = new Map<string, VolunteerRequest>();
   readonly claims = new ClaimRegistry();
   readonly canaries = new CanaryGate();
+  readonly decisions: DecisionStore;
+  /** The last standup built; null until the first. */
+  standup: Standup | null = null;
+  /** The current (or last) Lightning Round; kept after an abort so its log stays readable until the next start. */
+  lightning: LightningRound | null = null;
   selection: Selection = null;
   isPausing = false;
   isResuming = false;
@@ -146,6 +179,11 @@ export class Hub {
   private readonly sendInboxFn: (agent: Agent, text: string) => Promise<void>;
   private readonly gitChecks: (cwd: string) => Promise<WorktreeFinding>;
   private readonly osUserName: string;
+  private readonly readTailFn: (path: string) => Promise<TranscriptRead>;
+  private readonly readSinceFn: (path: string, offset: number) => Promise<TranscriptRead>;
+  private readonly lightningTiming: LightningTiming;
+  /** Working directory to the repo it belongs to, as the last `refreshRepos` found it. */
+  private repoByCwd = new Map<string, RepoRef>();
 
   constructor(deps: HubDeps = {}) {
     this.settings = { ...DEFAULT_SETTINGS, ...deps.settings };
@@ -154,6 +192,7 @@ export class Hub {
     this.sleep = deps.sleep ?? sleepReal;
     this.run = deps.run ?? runCommand;
     this.osUserName = deps.osUserName ?? safeUserName();
+    this.lightningTiming = deps.lightningTiming ?? {};
     const sessionsDir = join(this.settings.claudeDir, 'sessions');
     const claudeBin = () => resolveClaude(this.settings.claudePath);
     const list = deps.listAgents ?? (() => listAgents({ run: this.run, claudeBin: claudeBin() ?? 'claude', sessionsDir, clock: this.clock }));
@@ -161,10 +200,13 @@ export class Hub {
     this.gitChecks = deps.gitChecks ?? ((cwd) => gitWorktreeChecks(cwd, this.run));
     const tail = deps.readTail ?? ((p: string) => readTail(p));
     const since = deps.readSince ?? ((p: string, o: number) => readSince(p, o));
+    this.readTailFn = tail;
+    this.readSinceFn = since;
     const path = (a: Agent) => transcriptPath(a.cwd, a.sessionID, this.settings.claudeDir);
 
     this.roster = new RosterPoller({ list, resolveCli: claudeBin, sleep: this.sleep });
     this.ledger = new SessionLedger(this.kv, this.clock);
+    this.decisions = new DecisionStore(this.kv, this.clock);
     this.archive = new Archive(this.kv, this.clock);
     this.spawner = new Spawner({ run: this.run, claudeBin, clock: this.clock, sleep: this.sleep, alive: deps.alive ?? processAlive, listAgents: list, writeScript: deps.writeScript, openFile: deps.openFile });
     this.conversations = new ConversationStore({ clock: this.clock, sleep: this.sleep, readTail: tail, readSince: since, sendInbox: this.sendInboxFn, transcriptPath: path, onChange: (c) => this.emit({ type: 'conversation', sessionID: c.sessionID }) });
@@ -206,6 +248,7 @@ export class Hub {
     this.conversations.unloadAllIdle();
     this.groups.unloadAllIdle();
     for (const v of this.volunteers.values()) v.close();
+    this.lightning?.abort();
   }
 
   refresh(): Promise<void> {
@@ -410,11 +453,8 @@ export class Hub {
       clock: this.clock,
       sleep: this.sleep,
       sendInbox: this.sendInboxFn,
-      transcriptSize: async (a) => (await this.conversationsDeps().readTail(this.transcriptFor(a))).endOffset,
-      readSince: async (a, offset) => {
-        const r = await this.conversationsDeps().readSince(this.transcriptFor(a), offset);
-        return { texts: r.turns.filter((t) => t.role === 'assistant').map((t) => t.text), endOffset: r.endOffset };
-      },
+      transcriptSize: (a) => this.transcriptSize(a),
+      readSince: (a, offset) => this.assistantSince(a, offset),
       spawn: async (s) => {
         const { jobID } = await this.spawner.spawnBackground({ name: s.name, cwd: s.cwd, model: s.model, permissionMode: this.settings.permissionMode, prompt: s.prompt });
         void this.refresh();
@@ -432,9 +472,15 @@ export class Hub {
     return transcriptPath(a.cwd, a.sessionID, this.settings.claudeDir);
   }
 
-  private conversationsDeps(): { readTail: (p: string) => Promise<TranscriptRead>; readSince: (p: string, o: number) => Promise<TranscriptRead> } {
-    // The stores were built with the same injected readers; reach them through a thread-less call.
-    return (this.conversations as unknown as { deps: { readTail: (p: string) => Promise<TranscriptRead>; readSince: (p: string, o: number) => Promise<TranscriptRead> } }).deps;
+  /** Where an agent's transcript is now: replies to an ask are read from here on. */
+  private async transcriptSize(a: Agent): Promise<number> {
+    return (await this.readTailFn(this.transcriptFor(a))).endOffset;
+  }
+
+  /** The assistant texts appended after `offset`, for the features that wait for a reply block (volunteers, the Lightning Round). */
+  private async assistantSince(a: Agent, offset: number): Promise<{ texts: string[]; endOffset: number }> {
+    const r = await this.readSinceFn(this.transcriptFor(a), offset);
+    return { texts: r.turns.filter((t) => t.role === 'assistant').map((t) => t.text), endOffset: r.endOffset };
   }
 
   volunteer(id: string): VolunteerRequest {
@@ -590,6 +636,133 @@ export class Hub {
     return this.toast(`Renamed to ${shown} in cIM. Copied \`/rename ${shown}\` to the clipboard; run it ${where} to rename the session itself.`, `/rename ${shown}`);
   }
 
+  // ---- the Morning Standup and the Lightning Round (standup spec §6.4) ----------------------
+
+  /**
+   * Which repo each working directory belongs to, for the standup, the queue and the round. The round's `repoOf` is synchronous, so it reads
+   * `repoByCwd`; this fills it, one question per distinct directory so a linked worktree that lives outside the repo folder maps to its repo too.
+   * A session that appears mid-round is recognised at the next refresh (the next standup, queue read or round start), not before.
+   * A repo is named by its folder, so two repos with the same folder name share row keys (accepted).
+   */
+  private async refreshRepos(): Promise<RepoRef[]> {
+    const dirs = [...new Set([this.settings.repoPath, ...this.visibleAgents.map((a) => a.cwd)].filter((d): d is string => !!d))].slice(0, MAX_REPO_DIRS);
+    const found = await Promise.all(dirs.map(async (dir) => ({ dir, repo: (await discoverRepos(this.run, [dir]))[0] })));
+    const byPath = new Map<string, RepoRef>();
+    const byCwd = new Map<string, RepoRef>();
+    for (const { dir, repo } of found) {
+      if (!repo) continue;
+      const known = byPath.get(repo.path) ?? repo;
+      byPath.set(known.path, known);
+      byCwd.set(dir, known);
+    }
+    this.repoByCwd = byCwd;
+    return [...byPath.values()];
+  }
+
+  /** What a session last did, from the tail of its transcript. A read error rejects: the standup counts that as no activity. */
+  private async activity(agent: Agent): Promise<SessionActivity> {
+    const { turns } = await this.readTailFn(this.transcriptFor(agent));
+    let report: StatusReport | null = null;
+    for (let i = turns.length - 1; i >= 0 && !report; i--) if (turns[i].role === 'assistant') report = parseStatusReport(turns[i].text);
+    return { lastAt: turns.at(-1)?.timestamp ?? null, lastStatus: report?.status ?? null, lastScope: report?.scope ?? null };
+  }
+
+  /** Build the standup from local git, the ledgers and the sessions, keep it, and select it. Throws the engine's "covering must be ..." for a bad date. */
+  async buildStandup(covering?: string): Promise<Standup> {
+    const repos = await this.refreshRepos();
+    const standup = await buildBoard(
+      { clock: this.clock, run: this.run, repos, agents: this.visibleAgents, activity: (a) => this.activity(a) },
+      { covering, ticketPrefixes: this.settings.ticketPrefixes, ledgerRef: this.settings.ledgerRef, hidden: (key) => this.decisions.hidden(key) }
+    );
+    this.standup = standup;
+    this.setSelection({ kind: 'standup' });
+    this.emit({ type: 'standup' });
+    return standup;
+  }
+
+  /** The open ledger rows nobody has settled or put off, in queue order: the ones opened inside `window` (default: the last standup's) first. */
+  async openRows(window?: { start: number; end: number }): Promise<LedgerRow[]> {
+    const repos = await this.refreshRepos();
+    const reads = await Promise.all(repos.map((repo) => readLedger(this.run, repo, this.settings.ledgerRef)));
+    const rows = reads.flatMap((r) => r.rows).filter((row) => row.open && !this.decisions.hidden(row.key));
+    return orderLightningRows(rows, window ?? (this.standup ? { start: this.standup.windowStart, end: this.standup.windowEnd } : undefined));
+  }
+
+  /** Start a round over the open rows, narrowed to `keys` and/or the repo named `repo`. An empty queue is a round with nothing in it, not an error. */
+  async lightningStart(input: { keys?: string[]; repo?: string; panelSize?: number } = {}): Promise<LightningView> {
+    const { keys, repo } = input;
+    let rows = await this.openRows();
+    if (keys) rows = rows.filter((row) => keys.includes(row.key));
+    if (repo) rows = rows.filter((row) => row.repo === repo);
+    // The old round is stopped only now, in the same step that replaces it: two starts racing each other cannot leave a round running that nothing points at.
+    this.lightning?.abort();
+    const round = new LightningRound(
+      rows,
+      {
+        clock: this.clock,
+        sleep: this.sleep,
+        run: this.run,
+        messageable: () => this.messageableAgents,
+        repoOf: (agent) => this.repoByCwd.get(agent.cwd)?.path ?? null,
+        sendInbox: this.sendInboxFn,
+        transcriptSize: (a) => this.transcriptSize(a),
+        readSince: (a, offset) => this.assistantSince(a, offset),
+        decisions: this.decisions,
+        onChange: () => this.emit({ type: 'lightning' }),
+        ...this.lightningTiming,
+      },
+      { panelSize: input.panelSize }
+    );
+    this.lightning = round;
+    round.start(); // reports the change to the listeners itself
+    return round.view();
+  }
+
+  lightningView(): LightningView {
+    return this.lightning?.view() ?? emptyLightning();
+  }
+
+  private round(): LightningRound {
+    if (!this.lightning) throw new Error('No lightning round yet; POST /lightning/start first.');
+    return this.lightning;
+  }
+
+  lightningSelect(key: string): LightningView {
+    const round = this.round();
+    round.select(key);
+    return round.view();
+  }
+
+  async lightningApprove(key: string, letter: Letter): Promise<ApproveResult & { view: LightningView }> {
+    const round = this.round();
+    const result = await round.approve(key, letter);
+    return { ...result, view: round.view() };
+  }
+
+  lightningReject(key: string): LightningView {
+    const round = this.round();
+    round.reject(key);
+    return round.view();
+  }
+
+  lightningDefer(key: string): LightningView {
+    const round = this.round();
+    round.defer(key);
+    return round.view();
+  }
+
+  /** Ask a panel of other agents to vote on the card; resolves once the asks are sent. */
+  async lightningSkeptics(key: string): Promise<LightningView> {
+    const round = this.round();
+    await round.askSkeptics(key);
+    return round.view();
+  }
+
+  /** Stop the round's pollers. The round object stays, so its log and cards remain readable until the next start. */
+  lightningAbort(): void {
+    this.lightning?.abort();
+  }
+
   // ---- the status chip's chores (§7.4) ---------------------------------------------------
 
   private async sendChore(target: { sessionID?: string; groupKey?: string }, agent: Agent, text: string): Promise<boolean> {
@@ -654,40 +827,21 @@ export class Hub {
     return this.sendChore(target, this.requireAgent(agentID), tbuvReviewed(id, looksRight));
   }
 
-  /** The TB/UV records for a list of ids from the repo's wiki branch ledgers; duplicates keep the first; failures read as not found. */
+  /** The TB/UV records for a list of ids from the ledger ref of the repo `cwd` is in; open or closed rows alike; duplicates keep the first; failures read as not found. */
   async tbuvLookup(ids: string[], cwd: string): Promise<TbUvRecord[]> {
     const unique: string[] = [];
     for (const raw of ids) {
       const id = raw.trim();
       if (id && !unique.some((u) => u.toUpperCase() === id.toUpperCase())) unique.push(id);
     }
-    const read = async (file: string): Promise<Map<string, Record<string, unknown>>> => {
-      const out = new Map<string, Record<string, unknown>>();
-      try {
-        const r = await this.run('git', ['-C', cwd, 'show', `wiki:${file}`], { timeoutMs: 20_000 });
-        if (r.code !== 0) return out;
-        for (const line of r.stdout.split('\n')) {
-          if (!line.trim()) continue;
-          try {
-            const o = JSON.parse(line) as Record<string, unknown>;
-            const id = String(o.id ?? '').toUpperCase();
-            if (id && !out.has(id)) out.set(id, o);
-          } catch {
-            // a malformed line is skipped, never fatal
-          }
-        }
-      } catch {
-        // git missing or no wiki branch: everything is not found
-      }
-      return out;
-    };
-    const [tombstones, unverified] = await Promise.all([read('tombstones.jsonl'), read('unverified.jsonl')]);
+    // git finds the repo from `cwd`, so the name given here only decorates the row keys, which a lookup does not use.
+    const { rows } = await readLedger(this.run, { name: basename(cwd), path: cwd }, this.settings.ledgerRef);
     return unique.map((id): TbUvRecord => {
       const key = id.toUpperCase();
-      const tb = tombstones.get(key);
-      if (tb) return { id, kind: 'tombstone', date: str(tb.date ?? tb.ts), claim: str(tb.claim), supersededBy: str(tb.supersededBy ?? tb.superseded_by) };
-      const uv = unverified.get(key);
-      if (uv) return { id, kind: 'unverified', date: str(uv.date ?? uv.ts), claim: str(uv.claim), doubt: str(uv.doubt) };
+      const tb = rows.find((r) => r.kind === 'tombstone' && r.id === key);
+      if (tb) return { id, kind: 'tombstone', date: tb.date, claim: tb.claim, supersededBy: tb.supersededBy };
+      const uv = rows.find((r) => r.kind === 'unverified' && r.id === key);
+      if (uv) return { id, kind: 'unverified', date: uv.date, claim: uv.claim, doubt: uv.doubt };
       return { id, kind: 'not-found' };
     });
   }
@@ -749,6 +903,7 @@ export class Hub {
 
   snapshot(): HubSnapshot {
     const visible = this.visibleAgents;
+    const round = this.lightning?.view();
     return {
       at: this.clock(),
       roster: { agents: visible, hasLoaded: this.roster.hasLoaded, isRefreshing: this.roster.isRefreshing, lastError: this.roster.lastError, liveCount: this.liveCount },
@@ -763,6 +918,8 @@ export class Hub {
       settings: { ...this.settings, statePath: undefined },
       volunteerRequesterName: this.volunteerRequesterName,
       projectNames: Object.fromEntries(visible.map((a) => [a.sessionID, projectName(a)])),
+      standup: this.standup && { at: this.standup.at, covering: this.standup.covering, through: this.standup.through, run: this.standup.run, lanes: this.standup.lanes },
+      lightning: round ? { active: round.active, remaining: round.counts.remaining, current: round.current } : null,
     };
   }
 }
@@ -781,9 +938,9 @@ export interface HubSnapshot {
   settings: Omit<Settings, 'statePath'> & { statePath?: undefined };
   volunteerRequesterName: string;
   projectNames: Record<string, string>;
+  standup: { at: number; covering: string; through: string; run: string; lanes: Standup['lanes'] } | null;
+  lightning: { active: boolean; remaining: number; current: string | null } | null;
 }
-
-const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : v === undefined || v === null ? undefined : String(v));
 
 function safeUserName(): string {
   try {

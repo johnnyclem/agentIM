@@ -87,4 +87,9 @@ describe('the panel script never lets agent text reach an HTML parser', () => {
     expect(source).toContain('el.textContent = v');
     expect(source).toContain('el.append(kid.nodeType ? kid : String(kid))');
   });
+  it('sets no inline style: the CSP forbids the attribute, so every look comes from panel.css', () => {
+    expect(source).not.toMatch(/setAttribute\(\s*['"`]style['"`]/); // the attribute by name
+    expect(source).not.toMatch(/\bstyle\s*:/); // h(tag, { style: ... }) ends in setAttribute
+    expect(source).not.toContain('.style.cssText');
+  });
 });
