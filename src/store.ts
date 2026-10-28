@@ -54,4 +54,5 @@ export const KEYS = {
   resumeSet: 'cimResumeSet',
   lastRunning: 'cimLastRunning',
   volunteerRequester: 'cimVolunteerRequesterName',
+  lightning: 'cimLightningDecisions',
 } as const;
