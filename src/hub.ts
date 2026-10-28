@@ -15,6 +15,7 @@ import { basename, join } from 'node:path';
 import { type Agent, isMessageable, isStopped, shortID, projectName } from './agent.js';
 import { CLAUDE_DIR, readTail, readSince, transcriptPath, type TranscriptRead } from './transcript.js';
 import { runCommand, failureText, type Runner } from './runner.js';
+import { limitRunner } from './limit.js';
 import { listAgents, RosterPoller } from './roster.js';
 import { sendInboxMessage, NO_INBOX_MESSAGE } from './inbox.js';
 import { Conversation, ConversationStore } from './conversation.js';
@@ -25,7 +26,7 @@ import { SessionLedger } from './ledger.js';
 import { Archive } from './archive.js';
 import { buildStandup as buildBoard, orderLightningRows, type SessionActivity, type Standup } from './standup.js';
 import { DecisionStore, LightningRound, type ApproveResult, type LightningView } from './lightning.js';
-import { DEFAULT_LEDGER_REF, discoverRepos, readLedger, type LedgerRow, type RepoRef } from './tbuv-ledger.js';
+import { DEFAULT_LEDGER_REF, discoverRepos, readLedger, uniqueRepoNames, type LedgerRead, type LedgerRow, type RepoRef } from './tbuv-ledger.js';
 import type { Letter } from './lightning-format.js';
 import { JsonFileKV, KEYS, type KV } from './store.js';
 import { Spawner, resolveClaude, processAlive, gitWorktreeChecks, terminalTooltip, type PermissionMode } from './spawner.js';
@@ -146,6 +147,9 @@ const sleepReal = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** At most this many distinct directories are asked which repo they belong to. */
 const MAX_REPO_DIRS = 200;
 
+/** The standup, the queue and the round's grounding share this many git processes at a time; the rest wait. */
+const MAX_GIT_PROCESSES = 8;
+
 /** What GET /lightning says before any round was started. */
 const emptyLightning = (): LightningView => ({ active: false, current: null, panelSize: 4, items: [], counts: { total: 0, remaining: 0, decided: 0, deferred: 0 }, log: [] });
 
@@ -175,6 +179,8 @@ export class Hub {
   private listeners = new Set<(e: HubEvent) => void>();
   private pollCtrl: AbortController | null = null;
   private readonly run: Runner;
+  /** `run` for everything the standup, the queue and the round ask git; the roster and the spawner keep the plain one. */
+  private readonly gitRun: Runner;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly sendInboxFn: (agent: Agent, text: string) => Promise<void>;
   private readonly gitChecks: (cwd: string) => Promise<WorktreeFinding>;
@@ -184,6 +190,10 @@ export class Hub {
   private readonly lightningTiming: LightningTiming;
   /** Working directory to the repo it belongs to, as the last `refreshRepos` found it. */
   private repoByCwd = new Map<string, RepoRef>();
+  /** The roster read in flight (or the last one), never rejecting: `RosterPoller.refresh` returns at once when a read is running, so this is what a caller waits on. */
+  private rosterRead: Promise<unknown> = Promise.resolve();
+  /** Counts the starts and aborts of the Lightning Round; a start that finds it changed while it was reading has been overtaken. */
+  private lightningGen = 0;
 
   constructor(deps: HubDeps = {}) {
     this.settings = { ...DEFAULT_SETTINGS, ...deps.settings };
@@ -191,6 +201,7 @@ export class Hub {
     this.clock = deps.clock ?? Date.now;
     this.sleep = deps.sleep ?? sleepReal;
     this.run = deps.run ?? runCommand;
+    this.gitRun = limitRunner(this.run, MAX_GIT_PROCESSES);
     this.osUserName = deps.osUserName ?? safeUserName();
     this.lightningTiming = deps.lightningTiming ?? {};
     const sessionsDir = join(this.settings.claudeDir, 'sessions');
@@ -204,7 +215,15 @@ export class Hub {
     this.readSinceFn = since;
     const path = (a: Agent) => transcriptPath(a.cwd, a.sessionID, this.settings.claudeDir);
 
-    this.roster = new RosterPoller({ list, resolveCli: claudeBin, sleep: this.sleep });
+    this.roster = new RosterPoller({
+      list: () => {
+        const read = list();
+        this.rosterRead = read.catch(() => undefined);
+        return read;
+      },
+      resolveCli: claudeBin,
+      sleep: this.sleep,
+    });
     this.ledger = new SessionLedger(this.kv, this.clock);
     this.decisions = new DecisionStore(this.kv, this.clock);
     this.archive = new Archive(this.kv, this.clock);
@@ -248,7 +267,7 @@ export class Hub {
     this.conversations.unloadAllIdle();
     this.groups.unloadAllIdle();
     for (const v of this.volunteers.values()) v.close();
-    this.lightning?.abort();
+    this.lightningAbort();
   }
 
   refresh(): Promise<void> {
@@ -639,24 +658,32 @@ export class Hub {
   // ---- the Morning Standup and the Lightning Round (standup spec §6.4) ----------------------
 
   /**
+   * The sessions come from the roster, so a standup or a queue built before its first read would show an empty morning. Wait for that read:
+   * start one, or, when the poller's own is running (`refresh` returns at once then), wait for it. A read that failed leaves `lastError` for the caller to report.
+   */
+  private async rosterLoaded(): Promise<void> {
+    if (this.roster.hasLoaded) return;
+    await this.roster.refresh();
+    await this.rosterRead;
+  }
+
+  /**
    * Which repo each working directory belongs to, for the standup, the queue and the round. The round's `repoOf` is synchronous, so it reads
    * `repoByCwd`; this fills it, one question per distinct directory so a linked worktree that lives outside the repo folder maps to its repo too.
    * A session that appears mid-round is recognised at the next refresh (the next standup, queue read or round start), not before.
-   * A repo is named by its folder, so two repos with the same folder name share row keys (accepted).
+   * Two repos with one folder name are told apart here, where all of them are known: `discoverRepos` only ever sees one directory at a time.
    */
   private async refreshRepos(): Promise<RepoRef[]> {
+    await this.rosterLoaded();
     const dirs = [...new Set([this.settings.repoPath, ...this.visibleAgents.map((a) => a.cwd)].filter((d): d is string => !!d))].slice(0, MAX_REPO_DIRS);
-    const found = await Promise.all(dirs.map(async (dir) => ({ dir, repo: (await discoverRepos(this.run, [dir]))[0] })));
-    const byPath = new Map<string, RepoRef>();
+    const found = await Promise.all(dirs.map(async (dir) => ({ dir, repo: (await discoverRepos(this.gitRun, [dir]))[0] })));
+    const distinct = new Map<string, RepoRef>();
+    for (const { repo } of found) if (repo && !distinct.has(repo.path)) distinct.set(repo.path, repo);
+    const named = new Map(uniqueRepoNames([...distinct.values()]).map((repo) => [repo.path, repo]));
     const byCwd = new Map<string, RepoRef>();
-    for (const { dir, repo } of found) {
-      if (!repo) continue;
-      const known = byPath.get(repo.path) ?? repo;
-      byPath.set(known.path, known);
-      byCwd.set(dir, known);
-    }
+    for (const { dir, repo } of found) if (repo) byCwd.set(dir, named.get(repo.path) as RepoRef);
     this.repoByCwd = byCwd;
-    return [...byPath.values()];
+    return [...named.values()];
   }
 
   /** What a session last did, from the tail of its transcript. A read error rejects: the standup counts that as no activity. */
@@ -671,28 +698,49 @@ export class Hub {
   async buildStandup(covering?: string): Promise<Standup> {
     const repos = await this.refreshRepos();
     const standup = await buildBoard(
-      { clock: this.clock, run: this.run, repos, agents: this.visibleAgents, activity: (a) => this.activity(a) },
+      { clock: this.clock, run: this.gitRun, repos, agents: this.visibleAgents, activity: (a) => this.activity(a) },
       { covering, ticketPrefixes: this.settings.ticketPrefixes, ledgerRef: this.settings.ledgerRef, hidden: (key) => this.decisions.hidden(key) }
     );
+    // A roster that could not be read leaves no sessions, or only the ones the last good read listed: say so on the chip rather than show a plain count.
+    const failed = this.roster.lastError;
+    if (failed !== null) {
+      const sessions = standup.sources.find((c) => c.id === 'sessions');
+      if (sessions) sessions.note = [`roster unavailable: ${failed.replace(/\s+/g, ' ').trim().slice(0, 200)}`, sessions.note].filter(Boolean).join('; ');
+    }
     this.standup = standup;
     this.setSelection({ kind: 'standup' });
     this.emit({ type: 'standup' });
     return standup;
   }
 
-  /** The open ledger rows nobody has settled or put off, in queue order: the ones opened inside `window` (default: the last standup's) first. */
-  async openRows(window?: { start: number; end: number }): Promise<LedgerRow[]> {
+  /** The open rows, and what the read could not give: `repos` are the ones found, `reads[i]` is the ledger of `repos[i]`. */
+  private async readQueue(window?: { start: number; end: number }): Promise<{ rows: LedgerRow[]; repos: RepoRef[]; reads: LedgerRead[] }> {
     const repos = await this.refreshRepos();
-    const reads = await Promise.all(repos.map((repo) => readLedger(this.run, repo, this.settings.ledgerRef)));
+    const reads = await Promise.all(repos.map((repo) => readLedger(this.gitRun, repo, this.settings.ledgerRef)));
     const rows = reads.flatMap((r) => r.rows).filter((row) => row.open && !this.decisions.hidden(row.key));
-    return orderLightningRows(rows, window ?? (this.standup ? { start: this.standup.windowStart, end: this.standup.windowEnd } : undefined));
+    return { rows: orderLightningRows(rows, window ?? (this.standup ? { start: this.standup.windowStart, end: this.standup.windowEnd } : undefined)), repos, reads };
   }
 
-  /** Start a round over the open rows, narrowed to `keys` and/or the repo named `repo`. An empty queue is a round with nothing in it, not an error. */
+  /** The open ledger rows nobody has settled or put off, in queue order: the ones opened inside `window` (default: the last standup's) first. */
+  async openRows(window?: { start: number; end: number }): Promise<LedgerRow[]> {
+    return (await this.readQueue(window)).rows;
+  }
+
+  /**
+   * Start a round over the open rows, narrowed to `keys` and/or the repo named `repo`. An empty queue is a round with nothing in it, not an error;
+   * when it is empty (or short) because a repository or a ledger could not be found or read, the round's log says so.
+   * A start that was overtaken while it read (a newer start, or an abort) installs nothing and starts nothing: it returns the view as it stands.
+   */
   async lightningStart(input: { keys?: string[]; repo?: string; panelSize?: number } = {}): Promise<LightningView> {
+    const gen = ++this.lightningGen;
     const { keys, repo } = input;
-    let rows = await this.openRows();
-    if (keys) rows = rows.filter((row) => keys.includes(row.key));
+    const queue = await this.readQueue();
+    if (gen !== this.lightningGen) return this.lightningView();
+    let rows = queue.rows;
+    if (keys) {
+      const want = new Set(keys);
+      rows = rows.filter((row) => want.has(row.key));
+    }
     if (repo) rows = rows.filter((row) => row.repo === repo);
     // The old round is stopped only now, in the same step that replaces it: two starts racing each other cannot leave a round running that nothing points at.
     this.lightning?.abort();
@@ -701,7 +749,7 @@ export class Hub {
       {
         clock: this.clock,
         sleep: this.sleep,
-        run: this.run,
+        run: this.gitRun,
         messageable: () => this.messageableAgents,
         repoOf: (agent) => this.repoByCwd.get(agent.cwd)?.path ?? null,
         sendInbox: this.sendInboxFn,
@@ -714,6 +762,7 @@ export class Hub {
       { panelSize: input.panelSize }
     );
     this.lightning = round;
+    for (const line of queueProblems(queue.repos, queue.reads, repo)) round.note(line);
     round.start(); // reports the change to the listeners itself
     return round.view();
   }
@@ -733,9 +782,10 @@ export class Hub {
     return round.view();
   }
 
-  async lightningApprove(key: string, letter: Letter): Promise<ApproveResult & { view: LightningView }> {
+  /** `rev` is the card's `rev` the caller saw: a card that has changed since throws the engine's StaleCardError and sends nothing. */
+  async lightningApprove(key: string, letter: Letter, rev?: number): Promise<ApproveResult & { view: LightningView }> {
     const round = this.round();
-    const result = await round.approve(key, letter);
+    const result = await round.approve(key, letter, rev);
     return { ...result, view: round.view() };
   }
 
@@ -758,8 +808,9 @@ export class Hub {
     return round.view();
   }
 
-  /** Stop the round's pollers. The round object stays, so its log and cards remain readable until the next start. */
+  /** Stop the round's pollers, and any start that is still reading. The round object stays, so its log and cards remain readable until the next start. */
   lightningAbort(): void {
+    this.lightningGen++;
     this.lightning?.abort();
   }
 
@@ -835,7 +886,7 @@ export class Hub {
       if (id && !unique.some((u) => u.toUpperCase() === id.toUpperCase())) unique.push(id);
     }
     // git finds the repo from `cwd`, so the name given here only decorates the row keys, which a lookup does not use.
-    const { rows } = await readLedger(this.run, { name: basename(cwd), path: cwd }, this.settings.ledgerRef);
+    const { rows } = await readLedger(this.gitRun, { name: basename(cwd), path: cwd }, this.settings.ledgerRef);
     return unique.map((id): TbUvRecord => {
       const key = id.toUpperCase();
       const tb = rows.find((r) => r.kind === 'tombstone' && r.id === key);
@@ -940,6 +991,19 @@ export interface HubSnapshot {
   projectNames: Record<string, string>;
   standup: { at: number; covering: string; through: string; run: string; lanes: Standup['lanes'] } | null;
   lightning: { active: boolean; remaining: number; current: string | null } | null;
+}
+
+/** The lines for the round's log when the queue could not be read in full: no repository, a `repo` that names none, ledgers that could not be read or only in part. */
+function queueProblems(repos: RepoRef[], reads: LedgerRead[], repo?: string): string[] {
+  if (repos.length === 0) return ['No repository found: pass --repo or start an agent inside one.'];
+  const lines: string[] = [];
+  if (repo && !repos.some((r) => r.name === repo)) lines.push(`No repository named ${repo}; the repositories are ${repos.map((r) => r.name).join(', ')}.`);
+  const list = (bad: Array<{ name: string; why: string }>): string => (bad.length === 1 && repos.length === 1 ? bad[0].why : bad.map((b) => `${b.name}: ${b.why}`).join('; '));
+  const gone = repos.flatMap((r, i) => (reads[i].unavailable ? [{ name: r.name, why: reads[i].note ?? 'no ledger branch' }] : []));
+  if (gone.length) lines.push(`No ledger could be read in ${gone.length} repo(s): ${list(gone)}.`);
+  const partial = repos.flatMap((r, i) => (!reads[i].unavailable && reads[i].note !== undefined ? [{ name: r.name, why: reads[i].note as string }] : []));
+  if (partial.length) lines.push(`Part of the ledger could not be read in ${partial.length} repo(s): ${list(partial)}.`);
+  return lines;
 }
 
 function safeUserName(): string {

@@ -13,9 +13,8 @@
 import { randomUUID } from 'node:crypto';
 import { type Agent, shortID } from './agent.js';
 import { parseCite, groundCite, type Cite, type Grounding } from './grounding.js';
-import { hasFence, parsePresentation, parseVote, tallyVotes, type Checkable, type Letter, type Nature, type Needs, type RawOption, type RawPresentation, type RawVote, type Verb, type VoteTally } from './lightning-format.js';
+import { hasFence, namesAnotherRow, parsePresentation, parseVote, tallyVotes, type Checkable, type Letter, type Nature, type Needs, type RawOption, type RawPresentation, type RawVote, type Verb, type VoteTally } from './lightning-format.js';
 import { LIGHTNING_FENCE, lightningDecision, lightningPresentAsk, lightningVoteAsk, quoted } from './prompts.js';
-import { fencedBlock } from './status-report.js';
 import { KEYS, type KV } from './store.js';
 import type { Clock } from './clock.js';
 import type { Runner } from './runner.js';
@@ -68,6 +67,8 @@ export interface LightningItemView {
   row: Omit<LedgerRow, 'raw'>;
   phase: ItemPhase;
   presentation: Presentation | null;
+  /** Whole number that goes up every time the presentation is set, replaced or dropped; `approve` can name the one the human saw. */
+  rev: number;
   votes: { asked: boolean; tally: VoteTally; entries: VoteEntry[] };
   decision: { option: Letter; verb: Verb; at: number; delivered: boolean } | null;
 }
@@ -89,6 +90,14 @@ export interface ApproveResult {
   decided: boolean;
 }
 
+/** The card the human approved is not the one on the item any more (rejected and presented again, say). */
+export class StaleCardError extends Error {
+  constructor(key: string) {
+    super(`The card for ${key} changed; look again.`);
+    this.name = 'StaleCardError';
+  }
+}
+
 const DAY_MS = 86_400_000;
 /** A decided row comes back after this long if the ledger still lists it open. */
 const DECISION_TTL_MS = 7 * DAY_MS;
@@ -104,6 +113,7 @@ const MAX_PRESENTERS = 2;
 const PANEL_SIZE = 4;
 const PREFETCH = 1;
 const LOG_LINES = 20;
+const STOPPED = 'This round was stopped.';
 
 interface DecisionRecord {
   state: 'decided' | 'deferred';
@@ -176,6 +186,8 @@ interface Item {
   row: LedgerRow;
   phase: ItemPhase;
   presentation: Presentation | null;
+  /** Counts the changes of `presentation`; the view's `rev`. */
+  rev: number;
   /** Who presented it, for the decision relay; null for a ledger presentation. */
   presenter: Agent | null;
   rejectedBy: Set<string>;
@@ -187,7 +199,7 @@ interface Item {
   approving: Promise<ApproveResult> | null;
 }
 
-const newItem = (row: LedgerRow): Item => ({ row, phase: 'queued', presentation: null, presenter: null, rejectedBy: new Set(), epoch: 0, votes: { asked: false, entries: new Map() }, decision: null, approving: null });
+const newItem = (row: LedgerRow): Item => ({ row, phase: 'queued', presentation: null, rev: 0, presenter: null, rejectedBy: new Set(), epoch: 0, votes: { asked: false, entries: new Map() }, decision: null, approving: null });
 
 /** A card with something to act on. */
 const isOpenPhase = (p: ItemPhase): boolean => p === 'presented' || p === 'fallback';
@@ -218,25 +230,26 @@ function ledgerPresentation(row: LedgerRow): Presentation {
   return { source: 'ledger', presentedBy: row.raisedBy ?? '', needs: null, nature: null, checkable: null, title: quoted(row.claim ?? row.id, 200), claim: row.claim ?? '', assessment, evidence: [], options };
 }
 
-/** The `id:` line of the first cim-lightning block, closed or not; null when it has none or only the ask's echoed template. */
-function fenceId(text: string): string | null {
-  const body = fencedBlock(text + '\n```', LIGHTNING_FENCE);
-  const value = body === null ? undefined : /^[ \t]*id[ \t]*:[ \t]*(.*?)[ \t]*$/im.exec(body)?.[1];
-  return value && !value.includes('|') && !(value.startsWith('<') && value.endsWith('>')) ? value : null;
-}
-
 type Reply = { kind: 'usable'; parsed: RawPresentation } | { kind: 'unusable' } | { kind: 'chatty' } | { kind: 'foreign' };
 
 /**
- * One assistant text read for the ask about row `id`. Two asks to one agent share a transcript, so a block that names
- * another row is `foreign`: neither a win nor a failure of this ask. No fence at all is `chatty` and is ignored.
+ * One assistant text read for the ask about `row`. Two asks to one agent share a transcript, and the agent may answer both in one text,
+ * so every `cim-lightning` block in it is looked at: the first usable one that is about this row wins, and a text whose blocks all name
+ * another row (another id, or this id in another repo) is `foreign`: neither a win nor a failure of this ask. No fence at all is `chatty` and is ignored.
  */
-function classify(text: string, id: string): Reply {
-  const parsed = parsePresentation(text, id);
+function classify(text: string, row: LedgerRow): Reply {
+  const parsed = parsePresentation(text, row.id, row.repo);
   if (parsed) return { kind: 'usable', parsed };
   if (!hasFence(text, LIGHTNING_FENCE)) return { kind: 'chatty' };
-  const other = fenceId(text);
-  return other !== null && other.toLowerCase() !== id.trim().toLowerCase() ? { kind: 'foreign' } : { kind: 'unusable' };
+  return namesAnotherRow(text, LIGHTNING_FENCE, row.id, row.repo) ? { kind: 'foreign' } : { kind: 'unusable' };
+}
+
+/** An ask on its way to an agent or waiting for its answer. */
+interface Hold {
+  sessionID: string;
+  key: string;
+  /** The row id, lower-cased: what a reply is matched on. */
+  id: string;
 }
 
 type Asked = RawPresentation | 'unusable' | 'timeout' | 'failed' | 'stale';
@@ -249,6 +262,8 @@ export class LightningRound {
   private readonly ctrl = new AbortController();
   private readonly lines: string[] = [];
   private readonly tasks = new Set<Promise<void>>();
+  /** Asks sent to an agent and not yet answered. Ids are only unique per ledger file, and a reply names the id, so an agent is never asked about two rows with the same id at once. */
+  private readonly holds = new Set<Hold>();
   private readonly panelSize: number;
   private readonly prefetch: number;
 
@@ -295,9 +310,15 @@ export class LightningRound {
   }
 
   /** One status line; the caller reports the change. */
-  private note(line: string): void {
+  private log(line: string): void {
     this.lines.push(line);
     if (this.lines.length > LOG_LINES) this.lines.splice(0, this.lines.length - LOG_LINES);
+  }
+
+  /** Add a line to the round's log from outside (the hub reports a failure that happened before there were any items), bounded like the engine's own. */
+  note(text: string): void {
+    this.log(text);
+    this.changed();
   }
 
   private item(key: string): Item {
@@ -308,6 +329,19 @@ export class LightningRound {
 
   private stale(item: Item, epoch: number): boolean {
     return this.ctrl.signal.aborted || item.epoch !== epoch;
+  }
+
+  private hold(agent: Agent, row: LedgerRow): Hold {
+    const held: Hold = { sessionID: agent.sessionID, key: row.key, id: row.id.trim().toLowerCase() };
+    this.holds.add(held);
+    return held;
+  }
+
+  /** True when the agent has an unanswered ask about another row with the same id, whose reply this row's reader could not tell from its own. */
+  private busyWith(agent: Agent, row: LedgerRow): boolean {
+    const id = row.id.trim().toLowerCase();
+    for (const held of this.holds) if (held.sessionID === agent.sessionID && held.key !== row.key && held.id === id) return true;
+    return false;
   }
 
   /** Resolves when no background task is running. Tests call it; the pane never waits on it. */
@@ -363,7 +397,8 @@ export class LightningRound {
       row,
       phase: item.phase,
       presentation: item.presentation,
-      votes: { asked: item.votes.asked, tally: tallyVotes(entries.map((e) => (e.vote ? { id: row.id, vote: e.vote, prefers: e.prefers, reason: e.reason } : null))), entries },
+      rev: item.rev,
+      votes: { asked: item.votes.asked, tally: tallyVotes(entries.map((e) => (e.vote ? { id: row.id, repo: row.repo, vote: e.vote, prefers: e.prefers, reason: e.reason } : null))), entries },
       decision: item.decision ? { ...item.decision } : null,
     };
   }
@@ -427,7 +462,7 @@ export class LightningRound {
   private async runPresent(item: Item, epoch: number): Promise<void> {
     const { row } = item;
     const inRepo = this.deps.messageable().filter((a) => this.deps.repoOf(a) === row.repoPath);
-    const eligible = inRepo.filter((a) => !item.rejectedBy.has(a.sessionID));
+    const eligible = inRepo.filter((a) => !item.rejectedBy.has(a.sessionID) && !this.busyWith(a, row));
     const candidates = [...eligible.filter((a) => a.status !== 'busy'), ...eligible.filter((a) => a.status === 'busy')].slice(0, this.maxPresenters);
     if (candidates.length === 0) {
       // Everyone in the repo already rejected this row: show the ledger row without a word. Nobody there at all is worth saying.
@@ -435,7 +470,10 @@ export class LightningRound {
       return;
     }
     let timedOut = false;
+    let tried = false;
     for (const agent of candidates) {
+      if (this.busyWith(agent, row)) continue; // taken by an ask about a row with the same id since the candidates were picked
+      tried = true;
       const asked = await this.ask(item, epoch, agent);
       if (asked === 'stale') return;
       if (typeof asked === 'object') {
@@ -444,20 +482,31 @@ export class LightningRound {
       }
       if (asked === 'timeout') timedOut = true;
     }
-    this.fallback(item, epoch, timedOut ? 'The present call timed out.' : 'Nobody replied with a usable block.');
+    this.fallback(item, epoch, timedOut ? 'The present call timed out.' : tried ? 'Nobody replied with a usable block.' : null);
+  }
+
+  /** The ask to one agent, which holds the agent for as long as it is unanswered. */
+  private async ask(item: Item, epoch: number, agent: Agent): Promise<Asked> {
+    const held = this.hold(agent, item.row);
+    try {
+      return await this.exchange(item, epoch, agent);
+    } finally {
+      this.holds.delete(held);
+    }
   }
 
   /** Send the ask to one agent and read its transcript past the size it had before, until a usable block, an unusable one, or the timeout. */
-  private async ask(item: Item, epoch: number, agent: Agent): Promise<Asked> {
+  private async exchange(item: Item, epoch: number, agent: Agent): Promise<Asked> {
     const { row } = item;
     const who = `${agent.name} ${shortID(agent)}`;
     let offset: number;
     try {
       offset = await this.deps.transcriptSize(agent);
+      if (this.stale(item, epoch)) return 'stale'; // the card left play (or the round stopped) while the size was being read: nothing goes out
       await this.deps.sendInbox(agent, lightningPresentAsk(row));
     } catch (err) {
       if (this.stale(item, epoch)) return 'stale';
-      this.note(`${who} did not take the ask: ${errText(err)}`);
+      this.log(`${who} did not take the ask: ${errText(err)}`);
       this.changed();
       return 'failed';
     }
@@ -474,24 +523,24 @@ export class LightningRound {
       } catch (err) {
         if (!readFailed) {
           readFailed = true;
-          this.note(`${who} transcript could not be read: ${errText(err)}`);
+          this.log(`${who} transcript could not be read: ${errText(err)}`);
           this.changed();
         }
         continue;
       }
       if (this.stale(item, epoch)) return 'stale';
       offset = read.endOffset;
-      const replies = read.texts.map((t) => ({ text: t, reply: classify(t, row.id) }));
+      const replies = read.texts.map((t) => ({ text: t, reply: classify(t, row) }));
       const usable = replies.find((r) => r.reply.kind === 'usable')?.reply;
       if (usable?.kind === 'usable') return usable.parsed;
       if (replies.some((r) => r.reply.kind === 'unusable')) {
-        this.note(`${who} replied without a usable block.`);
+        this.log(`${who} replied without a usable block.`);
         this.changed();
         return 'unusable';
       }
       if (replies.some((r) => r.reply.kind === 'chatty' && r.text.trim() !== '')) wrote = true;
     }
-    this.note(wrote ? `${who} replied without a usable block.` : `${who} did not reply within ${Math.round(this.presentTimeoutMs / 1000)}s.`);
+    this.log(wrote ? `${who} replied without a usable block.` : `${who} did not reply within ${Math.round(this.presentTimeoutMs / 1000)}s.`);
     this.changed();
     return 'timeout';
   }
@@ -508,6 +557,7 @@ export class LightningRound {
     const options: PresentedOption[] = raw.options.map((o) => ({ ...o, grounding: o.cites.some((n) => evidence.find((e) => e.n === n)?.grounding.status === 'grounded') ? 'grounded' : 'ungrounded' }));
     item.presentation = { source: 'agent', presentedBy: agent.name, needs: raw.needs, nature: raw.nature, checkable: raw.checkable, title: raw.title, claim: raw.claim, assessment: raw.assessment, evidence, options };
     item.presenter = agent;
+    item.rev++;
     item.phase = 'presented';
     this.changed();
   }
@@ -517,8 +567,9 @@ export class LightningRound {
     if (this.stale(item, epoch)) return;
     item.presentation = ledgerPresentation(item.row);
     item.presenter = null;
+    item.rev++;
     item.phase = 'fallback';
-    if (reason !== null) this.note(`No presentation for ${item.row.key}: ${reason} Showing the ledger row.`);
+    if (reason !== null) this.log(`No presentation for ${item.row.key}: ${reason} Showing the ledger row.`);
     this.changed();
   }
 
@@ -528,9 +579,11 @@ export class LightningRound {
    * Approve option `letter`. no_change records the decision and sends nothing; the other verbs relay it to the presenting agent
    * (for a ledger card, the first messageable agent of the row's repo) and record it only once it was taken.
    * A second approve of a decided item sends nothing, and approves racing each other send once.
+   * `rev` is the card's `rev` the human saw: when the card has changed since, this throws StaleCardError and sends nothing.
    */
-  async approve(key: string, letter: Letter): Promise<ApproveResult> {
+  async approve(key: string, letter: Letter, rev?: number): Promise<ApproveResult> {
     const item = this.item(key);
+    if (rev !== undefined && rev !== item.rev) throw new StaleCardError(key);
     const presentation = item.presentation;
     const option = presentation?.options.find((o) => o.letter === letter);
     if (presentation && !option) throw new Error(`Option ${letter} is not offered for ${key}.`);
@@ -557,14 +610,14 @@ export class LightningRound {
     }
     const to = this.recipient(item, presentation);
     if (!to) {
-      this.note(`Nobody in ${row.repo} can be messaged: copy the decision by hand.`);
+      this.log(`Nobody in ${row.repo} can be messaged: copy the decision by hand.`);
       this.changed();
       return { delivered: false, decided: false };
     }
     try {
       await this.deps.sendInbox(to, lightningDecision(row, { letter: option.letter, verb: option.verb, title: option.title, why: option.why }, presentation));
     } catch (err) {
-      this.note(`${to.name} did not take the decision: ${errText(err)}`);
+      this.log(`${to.name} did not take the decision: ${errText(err)}`);
       this.changed();
       return { delivered: false, decided: false };
     }
@@ -595,16 +648,17 @@ export class LightningRound {
     try {
       this.deps.decisions.record(item.row.key, rec, until);
     } catch (err) {
-      this.note(`Could not save the ${rec.state === 'deferred' ? 'deferral' : 'decision'} for ${item.row.key}: ${errText(err)}`);
+      this.log(`Could not save the ${rec.state === 'deferred' ? 'deferral' : 'decision'} for ${item.row.key}: ${errText(err)}`);
     }
   }
 
   /** None of these: drop the card, remember who presented it, and ask again later (the back of the queue) with someone else. Nothing is sent. */
   reject(key: string): void {
     const item = this.item(key);
-    if (item.approving || !isOpenPhase(item.phase)) return;
+    if (!this.active || item.approving || !isOpenPhase(item.phase)) return; // a stopped round has nobody left to present the row again
     if (item.presentation?.source === 'agent' && item.presenter) item.rejectedBy.add(item.presenter.sessionID);
     item.epoch++;
+    item.rev++;
     item.presentation = null;
     item.presenter = null;
     item.votes = { asked: false, entries: new Map() };
@@ -631,50 +685,74 @@ export class LightningRound {
 
   /**
    * Ask a panel of other agents to vote on the card: not the presenter, the row's repo first, then roster order, at most `panelSize`
-   * in all. An agent already asked is not asked again. Resolves once the asks are sent; the votes are read in the background.
+   * in all. An agent already asked is not asked again, nor is one with an unanswered ask about another row with the same id. Resolves
+   * once the asks are sent; the votes are read in the background. `asked` turns true only when somebody was asked, so with nobody to
+   * ask the human can try again later. A stopped round asks nobody.
    */
   async askSkeptics(key: string): Promise<void> {
     const item = this.item(key);
+    if (this.ctrl.signal.aborted) {
+      if (this.lines.at(-1) !== STOPPED) this.note(STOPPED);
+      return;
+    }
     const presentation = item.presentation;
     if (!presentation || !isOpenPhase(item.phase)) return;
     const { row } = item;
     const epoch = item.epoch;
-    item.votes.asked = true;
-    const others = this.deps.messageable().filter((a) => a.sessionID !== item.presenter?.sessionID && !item.votes.entries.has(a.sessionID));
+    const live = (): boolean => !this.stale(item, epoch) && isOpenPhase(item.phase);
+    const others = this.deps.messageable().filter((a) => a.sessionID !== item.presenter?.sessionID && !item.votes.entries.has(a.sessionID) && !this.busyWith(a, row));
     const sameRepo = (a: Agent): boolean => this.deps.repoOf(a) === row.repoPath;
     const panel = [...others.filter(sameRepo), ...others.filter((a) => !sameRepo(a))].slice(0, Math.max(0, this.panelSize - item.votes.entries.size));
-    if (panel.length === 0 && item.votes.entries.size === 0) this.note(`No other agent can be messaged to vote on ${key}.`);
+    if (panel.length === 0) {
+      if (item.votes.entries.size === 0) this.log(`No other agent can be messaged to vote on ${key}.`);
+      this.changed();
+      return;
+    }
+    item.votes.asked = true;
     for (const a of panel) item.votes.entries.set(a.sessionID, { sessionID: a.sessionID, name: a.name, vote: null, prefers: null, reason: '' });
     this.changed();
-    const sent: Array<{ agent: Agent; offset: number }> = [];
+    const sent: Array<{ agent: Agent; offset: number; held: Hold }> = [];
     await Promise.all(
       panel.map(async (agent) => {
+        const held = this.hold(agent, row);
         try {
           const offset = await this.deps.transcriptSize(agent);
+          if (!live()) {
+            this.holds.delete(held); // the card left play (or the round stopped) while the size was being read: nothing goes out
+            return;
+          }
           await this.deps.sendInbox(agent, lightningVoteAsk(row, presentation));
-          sent.push({ agent, offset });
+          sent.push({ agent, offset, held });
         } catch (err) {
-          this.note(`${agent.name} ${shortID(agent)} did not take the vote ask: ${errText(err)}`);
+          this.holds.delete(held);
+          this.log(`${agent.name} ${shortID(agent)} did not take the vote ask: ${errText(err)}`);
         }
       })
     );
-    if (this.stale(item, epoch)) return;
+    if (this.stale(item, epoch)) {
+      for (const s of sent) this.holds.delete(s.held);
+      return;
+    }
     this.changed();
-    if (sent.length) this.spawn(this.watchVotes(item, epoch, sent), (err) => this.noteAndChange(`Reading the votes for ${key} failed: ${errText(err)}`));
-  }
-
-  private noteAndChange(line: string): void {
-    this.note(line);
-    this.changed();
+    if (sent.length) this.spawn(this.watchVotes(item, epoch, sent), (err) => this.note(`Reading the votes for ${key} failed: ${errText(err)}`));
   }
 
   /** Read the asked agents' transcripts until all have voted, the card closes, the round is aborted, or the late window ends. */
-  private async watchVotes(item: Item, epoch: number, asked: Array<{ agent: Agent; offset: number }>): Promise<void> {
+  private async watchVotes(item: Item, epoch: number, asked: Array<{ agent: Agent; offset: number; held: Hold }>): Promise<void> {
+    try {
+      await this.readVotes(item, epoch, asked);
+    } finally {
+      for (const a of asked) this.holds.delete(a.held);
+    }
+  }
+
+  private async readVotes(item: Item, epoch: number, asked: Array<{ agent: Agent; offset: number; held: Hold }>): Promise<void> {
     const { row } = item;
     const windowEnd = this.deps.clock() + this.voteTimeoutMs;
     const deadline = windowEnd + LATE_VOTE_MS;
     const waiting = new Map(asked.map((a) => [a.agent.sessionID, a]));
     const open = (): boolean => !this.stale(item, epoch) && isOpenPhase(item.phase);
+    const unreadable = new Set<string>();
     let warned = false;
     while (waiting.size > 0 && this.deps.clock() < deadline) {
       if (!(await this.nap(Math.min(this.pollMs, deadline - this.deps.clock())))) return;
@@ -684,22 +762,28 @@ export class LightningRound {
           let read: { texts: string[]; endOffset: number };
           try {
             read = await this.deps.readSince(w.agent, w.offset);
-          } catch {
-            return; // tried again at the next poll
+          } catch (err) {
+            // tried again at the next poll; the agent stays silent in the tally, and the first failure says why
+            if (!unreadable.has(w.agent.sessionID) && open()) {
+              unreadable.add(w.agent.sessionID);
+              this.log(`${w.agent.name} ${shortID(w.agent)} transcript could not be read: ${errText(err)}`);
+            }
+            return;
           }
           w.offset = read.endOffset;
-          const votes = read.texts.map((t) => parseVote(t, row.id)).filter((v): v is RawVote => v !== null);
+          const votes = read.texts.map((t) => parseVote(t, row.id, row.repo)).filter((v): v is RawVote => v !== null);
           const vote = votes[votes.length - 1];
           const entry = item.votes.entries.get(w.agent.sessionID);
           if (!vote || !entry) return;
           Object.assign(entry, { vote: vote.vote, prefers: vote.prefers, reason: vote.reason });
           waiting.delete(w.agent.sessionID);
+          this.holds.delete(w.held); // answered: the agent may be asked about a row with the same id now
         })
       );
       if (!open()) return;
       if (!warned && waiting.size > 0 && this.deps.clock() >= windowEnd) {
         warned = true;
-        this.note(`${waiting.size} of ${asked.length} did not vote on ${row.key} within ${Math.round(this.voteTimeoutMs / 1000)}s. A late vote still counts.`);
+        this.log(`${waiting.size} of ${asked.length} did not vote on ${row.key} within ${Math.round(this.voteTimeoutMs / 1000)}s. A late vote still counts.`);
       }
       this.changed();
     }

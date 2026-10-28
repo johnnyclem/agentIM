@@ -70,7 +70,7 @@ describe('GET and POST /standup', () => {
     expect(built.status).toBe(200);
     expect(Object.keys(built.json).sort()).toEqual(['at', 'board', 'covering', 'lanes', 'run', 'sources', 'through', 'windowEnd', 'windowStart']);
     expect(built.json).toMatchObject({ covering: '2026-10-26', through: '2026-10-26', run: '2026-10-27', lanes: { triage: 2, agents: 1, lightning: 2 } });
-    expect(built.json.sources.map((s: { id: string; count: number }) => [s.id, s.count])).toEqual([['git', 3], ['ledger', 2], ['sessions', 1]]);
+    expect(built.json.sources.map((s: { id: string; count: number }) => [s.id, s.count])).toEqual([['git', 3], ['ledger', 4], ['sessions', 1]]);
     expect(Object.keys(built.json.board[0]).sort()).toEqual(expect.arrayContaining(['id', 'lane', 'refs', 'sources', 'state', 'tint', 'title']));
     expect((await call('GET', '/standup')).json).toEqual(built.json);
     expect(w.hub.selection).toEqual({ kind: 'standup' });
@@ -148,7 +148,7 @@ describe('the /lightning routes', () => {
     const view = (await call('GET', '/lightning')).json;
     expect(Object.keys(view).sort()).toEqual(['active', 'counts', 'current', 'items', 'log', 'panelSize']);
     const card = view.items[0];
-    expect(Object.keys(card).sort()).toEqual(['decision', 'id', 'key', 'kind', 'phase', 'presentation', 'repo', 'row', 'summary', 'title', 'votes']);
+    expect(Object.keys(card).sort()).toEqual(['decision', 'id', 'key', 'kind', 'phase', 'presentation', 'repo', 'rev', 'row', 'summary', 'title', 'votes']);
     expect(card).toMatchObject({ key: UV_36, kind: 'unverified', phase: 'presented', decision: null, votes: { asked: false, tally: { asked: 0, silent: 0 } } });
     expect(card.row).toMatchObject({ id: 'UV-0036', repo: 'shop-app', date: '2026-10-26', open: true });
     expect(card.row.raw).toBeUndefined();
@@ -180,8 +180,8 @@ describe('the /lightning routes', () => {
 
     const skeptics = await call('POST', '/lightning/skeptics', { key: UV_36 });
     expect(skeptics.status).toBe(200);
-    expect(skeptics.json.items[0].votes.asked).toBe(true);
-    expect(skeptics.json.items[0].votes.tally).toMatchObject({ asked: 0 }); // nobody else is messageable here: the panel is empty, and the log says so
+    expect(skeptics.json.items[0].votes.asked).toBe(false); // nobody else is messageable here: nobody was asked, so the card is not marked asked (a retry asks a newcomer), and the log says so
+    expect(skeptics.json.items[0].votes.tally).toMatchObject({ asked: 0 });
     expect(skeptics.json.log.at(-1)).toBe(`No other agent can be messaged to vote on ${UV_36}.`);
 
     const approved = await call('POST', '/lightning/approve', { key: UV_36, option: 'A' });
@@ -194,6 +194,68 @@ describe('the /lightning routes', () => {
 
     expect((await call('POST', '/lightning/abort')).json).toEqual({ ok: true });
     expect((await call('GET', '/lightning')).json).toMatchObject({ active: false, counts: { decided: 1, deferred: 1 } }); // the round stays readable
+  });
+});
+
+describe('POST /lightning/approve names the card it approves', () => {
+  it('every card carries its rev; an approve that names it applies to that card, and one without it works as before', async () => {
+    const { w, call } = await shop();
+    await call('POST', '/lightning/start', { keys: [UV_36, UV_21] });
+    await w.settle();
+    const items = (await call('GET', '/lightning')).json.items as Array<{ key: string; rev: number }>;
+    expect(items.map((i) => typeof i.rev)).toEqual(['number', 'number']);
+    expect(items.every((i) => Number.isInteger(i.rev) && i.rev >= 0)).toBe(true);
+    expect(items[0].rev).toBeGreaterThan(0); // it was presented: the card changed from nothing to something
+
+    const withRev = await call('POST', '/lightning/approve', { key: UV_36, option: 'C', rev: items[0].rev });
+    expect(withRev.status).toBe(200);
+    expect(withRev.json).toMatchObject({ delivered: false, decided: true }); // No change decides and sends nothing
+    const without = await call('POST', '/lightning/approve', { key: UV_21, option: 'C' });
+    expect(without.status).toBe(200);
+    expect(without.json).toMatchObject({ decided: true });
+  });
+
+  it('a card that has changed since the caller saw it is a 409 with the engine’s message, and nothing is sent or decided', async () => {
+    const { w, call } = await shop();
+    await call('POST', '/lightning/start', { keys: [UV_36] });
+    await w.settle();
+    const seen = (await call('GET', '/lightning')).json.items[0].rev as number;
+
+    await call('POST', '/lightning/reject', { key: UV_36 }); // another tab rejects it: the card is replaced
+    await w.settle();
+    const now = (await call('GET', '/lightning')).json.items[0].rev as number;
+    expect(now).not.toBe(seen);
+
+    const sentBefore = w.sent.length;
+    const stale = await call('POST', '/lightning/approve', { key: UV_36, option: 'A', rev: seen });
+    expect(stale.status).toBe(409);
+    expect(stale.json).toEqual({ error: `The card for ${UV_36} changed; look again.` });
+    expect(w.sent).toHaveLength(sentBefore);
+    expect(w.hub.decisions.hidden(UV_36)).toBe(false);
+    expect((await call('GET', '/lightning')).json.items[0]).toMatchObject({ phase: 'fallback', decision: null });
+
+    // looking again gives the new rev, and that one goes through
+    const fresh = await call('POST', '/lightning/approve', { key: UV_36, option: 'A', rev: now });
+    expect(fresh.status).toBe(200);
+    expect(fresh.json).toMatchObject({ delivered: true, decided: true });
+    expect(w.sent.slice(sentBefore).map((s) => kindOf(s.text))).toEqual(['decision']);
+  });
+
+  it('a rev that is not a whole number from 0 up is a 400, before anything is looked at or sent', async () => {
+    const { w, call } = await shop();
+    await call('POST', '/lightning/start', { keys: [UV_36] });
+    await w.settle();
+    const sentBefore = w.sent.length;
+    for (const rev of [-1, 1.5, '1', null, true, [], {}]) {
+      const r = await call('POST', '/lightning/approve', { key: UV_36, option: 'A', rev });
+      expect(r.status, JSON.stringify(rev)).toBe(400);
+      expect(r.json).toEqual({ error: 'rev is a whole number from 0 up' });
+    }
+    expect(w.sent).toHaveLength(sentBefore);
+    expect((await call('GET', '/lightning')).json.items[0].phase).toBe('presented');
+    // a rev for a key that is not there is still the unknown key's 404, and a rev of 0 is a rev (a number): the card is on a later one, so it is stale
+    expect((await call('POST', '/lightning/approve', { key: 'uv:shop-app:UV-9999', option: 'A', rev: 0 })).status).toBe(404);
+    expect((await call('POST', '/lightning/approve', { key: UV_36, option: 'A', rev: 0 })).status).toBe(409);
   });
 });
 

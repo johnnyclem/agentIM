@@ -54,18 +54,34 @@ const COMMITS: Commit[] = [
 
 type Hook = (args: string[]) => RunResult;
 
-/** Records every call. A hook is keyed by 'rev-parse', 'cat-file -t', 'cat-file -s' or 'show'; it may return a result or throw. */
+/** Where the checkout sits: `prefix` is its folder below the repo root ('' at the root, else ending in '/'), `top` the root. null: git cannot say. */
+interface Layout {
+  prefix: string;
+  top: string;
+}
+const isLayoutCall = (args: string[]) => args[2] === 'rev-parse' && args[3] === '--show-prefix';
+
+/**
+ * Records every call. A hook is keyed by 'rev-parse', 'layout' (the `--show-prefix --show-toplevel` question), 'cat-file -t', 'cat-file -s' or 'show'; it may return a result or throw.
+ * The checkout is at the repo root unless `h.layout` says otherwise; `subs()` leaves the layout question out, so the sequences below read as the work done on the cite.
+ */
 function harness(commits: Commit[] = COMMITS, head: string | null = HEAD) {
   const calls: Array<{ cmd: string; args: string[]; opts?: RunOptions }> = [];
   const hooks = new Map<string, Hook>();
+  const state: { layout: Layout | null } = { layout: { prefix: '', top: DIR } };
   const ok = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
   const fail = (code: number, stderr = ''): RunResult => ({ code, stdout: '', stderr });
   const run: Runner = async (cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     const [dashC, dir, sub, ...rest] = args;
     if (cmd !== 'git' || dashC !== '-C' || dir !== DIR) throw new Error(`unexpected invocation: ${cmd} ${args.join(' ')}`);
-    const hooked = hooks.get(sub === 'cat-file' ? `cat-file ${rest[0]}` : sub);
+    const layoutCall = isLayoutCall(args);
+    const hooked = hooks.get(layoutCall ? 'layout' : sub === 'cat-file' ? `cat-file ${rest[0]}` : sub);
     if (hooked) return hooked(rest);
+    if (layoutCall) {
+      if (rest.length !== 2 || rest[1] !== '--show-toplevel') throw new Error(`unexpected rev-parse: ${rest.join(' ')}`);
+      return state.layout === null ? fail(128, 'fatal: this operation must be run in a work tree') : ok(`${state.layout.prefix}\n${state.layout.top}\n`);
+    }
     if (sub === 'rev-parse') {
       if (rest.length !== 3 || rest[0] !== '--verify' || rest[1] !== '--quiet' || !rest[2].endsWith('^{commit}')) throw new Error(`unexpected rev-parse: ${rest.join(' ')}`);
       const name = rest[2].slice(0, -'^{commit}'.length);
@@ -83,7 +99,15 @@ function harness(commits: Commit[] = COMMITS, head: string | null = HEAD) {
     if (!isCat) return ok(entry.content);
     return ok(rest[0] === '-t' ? `${entry.type}\n` : `${entry.size ?? Buffer.byteLength(entry.content)}\n`);
   };
-  return { run, calls, hooks, subs: () => calls.map((c) => (c.args[2] === 'cat-file' ? `cat-file ${c.args[3]}` : c.args[2])) };
+  return {
+    run,
+    calls,
+    hooks,
+    set layout(l: Layout | null) {
+      state.layout = l;
+    },
+    subs: () => calls.filter((c) => !isLayoutCall(c.args)).map((c) => (c.args[2] === 'cat-file' ? `cat-file ${c.args[3]}` : c.args[2])),
+  };
 }
 
 const must = (raw: string): Cite => {
@@ -152,6 +176,12 @@ describe('parseCite: accepted forms', () => {
     expect(parseCite('a`b`|c&d>e.ts:1')?.path).toBe('a`b`|c&d>e.ts');
   });
 
+  it('an absolute path is accepted as text, so groundCite can map it into the repo or refuse it; the other validations stay', () => {
+    expect(parseCite('/work/shop-app/src/session.ts:12-18@75c7b13')).toStrictEqual({ raw: '/work/shop-app/src/session.ts:12-18@75c7b13', path: '/work/shop-app/src/session.ts', startLine: 12, endLine: 18, sha: '75c7b13' });
+    expect(parseCite('/etc/passwd:1')?.path).toBe('/etc/passwd');
+    for (const text of ['/a/../etc/passwd:1', '/..:1', '/a\\b:1', '/a\0b:1', '/etc/passwd', '/etc/passwd:0', '/:']) expect(parseCite(text), text).toBeNull();
+  });
+
   it('the line bounds: 1 up to 10 000 000', () => {
     expect(parseCite('a.ts:1')?.startLine).toBe(1);
     expect(parseCite('a.ts:10000000')).toMatchObject({ startLine: 10_000_000, endLine: 10_000_000 });
@@ -193,7 +223,6 @@ describe('parseCite: rejected forms are null, never a throw', () => {
     ['a parent in the middle', 'a/../b:1'],
     ['a parent at the end', 'a/..:1'],
     ['a bare ..', '..:1'],
-    ['an absolute path', '/etc/passwd:1'],
     ['a backslash', 'a\\b:1'],
     ['a windows parent', '..\\x:1'],
     ['a NUL in the path', 'a\0b:1'],
@@ -247,8 +276,7 @@ describe('parseCite: properties', () => {
         const c = parseCite(text);
         if (c === null) return;
         expect(c.raw).toBe(text.trim());
-        expect(c.path.startsWith('-')).toBe(false);
-        expect(c.path.startsWith('/')).toBe(false);
+        expect(c.path.startsWith('-')).toBe(false); // an absolute path is text here; groundCite never hands one to git (see below)
         expect(c.path.includes('\\') || c.path.includes('\0')).toBe(false);
         expect(c.path.split('/')).not.toContain('..');
         expect(c.path).not.toMatch(/[\s:"]/);
@@ -273,12 +301,14 @@ describe('groundCite: the happy paths', () => {
     const object = `${HEAD}:src/session.ts`;
     expect(h.calls.map((c) => c.args)).toStrictEqual([
       ['-C', DIR, 'rev-parse', '--verify', '--quiet', '75c7b13^{commit}'],
+      ['-C', DIR, 'rev-parse', '--show-prefix', '--show-toplevel'],
       ['-C', DIR, 'cat-file', '-t', object],
       ['-C', DIR, 'cat-file', '-s', object],
       ['-C', DIR, 'show', object],
     ]);
     expect(h.calls.every((c) => c.cmd === 'git')).toBe(true);
-    expect(h.calls.every((c) => JSON.stringify(c.opts) === JSON.stringify({ timeoutMs: 20_000 }))).toBe(true);
+    // every call has the timeout; only the read of the file is capped, one byte past the largest file that may be checked
+    expect(h.calls.map((c) => c.opts)).toStrictEqual([{ timeoutMs: 20_000 }, { timeoutMs: 20_000 }, { timeoutMs: 20_000 }, { timeoutMs: 20_000 }, { timeoutMs: 20_000, maxOutputBytes: MB2 + 1 }]);
   });
 
   it('grounded with a 40-digit sha: the result carries only the first 7', async () => {
@@ -383,6 +413,199 @@ describe('groundCite: why a cite is ungrounded', () => {
     const h = harness();
     h.hooks.set('cat-file -t', () => ({ code: 0, stdout: 'commit\n', stderr: '' }));
     expect(await ground(h, 'src/session.ts:1')).toStrictEqual(bad('src/session.ts is not a file'));
+  });
+});
+
+describe('groundCite: git that did not answer is not a verdict about the cite', () => {
+  const timedOut: RunResult = { code: 1, stdout: '', stderr: '', timedOut: true };
+  const cut: RunResult = { code: 1, stdout: 'partial', stderr: '', truncated: true };
+
+  const object = `${HEAD}:src/session.ts`;
+  // the stage a hook stands for, and the last call that may have been made when it answers
+  const stages: Array<[string, string[]]> = [
+    ['rev-parse', ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']],
+    ['layout', ['rev-parse', '--show-prefix', '--show-toplevel']],
+    ['cat-file -t', ['cat-file', '-t', object]],
+    ['cat-file -s', ['cat-file', '-s', object]],
+    ['show', ['show', object]],
+  ];
+
+  it.each(stages)('a timeout at %s is "git timed out", not a missing commit or file, and nothing runs after it', async (stage, last) => {
+    const h = harness();
+    h.hooks.set(stage, () => timedOut);
+    expect(await ground(h, 'src/session.ts:1')).toStrictEqual(bad('git timed out'));
+    expect(h.calls.at(-1)?.args.slice(2)).toStrictEqual(last);
+  });
+
+  it.each(stages)('output cut at the cap at %s is "output too large"', async (stage, last) => {
+    const h = harness();
+    h.hooks.set(stage, () => cut);
+    expect(await ground(h, 'src/session.ts:1')).toStrictEqual(bad('output too large'));
+    expect(h.calls.at(-1)?.args.slice(2)).toStrictEqual(last);
+  });
+
+  it('a timeout reads the same with an explicit sha, and for a file that is not there either way', async () => {
+    const h = harness();
+    h.hooks.set('rev-parse', () => timedOut);
+    expect(await ground(h, 'src/session.ts:1@75c7b13')).toStrictEqual(bad('git timed out'));
+    expect(await ground(h, 'no/such/file.ts:1')).toStrictEqual(bad('git timed out'));
+  });
+
+  it('the read of the file is capped one byte above the largest file that may be checked; a cut read is not "too large to check" by guesswork', async () => {
+    const h = harness();
+    await ground(h, 'src/session.ts:1');
+    const shown = h.calls.find((c) => c.args[2] === 'show');
+    expect(shown?.opts).toStrictEqual({ timeoutMs: 20_000, maxOutputBytes: MB2 + 1 });
+  });
+
+  it('a plain failure is still a verdict: an unknown commit and a missing file read as before', async () => {
+    const h = harness();
+    expect(await ground(h, 'src/session.ts:1@deadbee')).toStrictEqual(bad('commit deadbee not found'));
+    expect(await ground(h, 'nope.ts:1')).toStrictEqual(bad('nope.ts is not in 75c7b13'));
+  });
+});
+
+describe('groundCite: a checkout below the repo root reads the cite the way the agent saw it', () => {
+  const TOP = '/repo';
+  const lines = (n: number, tag: string) => Array.from({ length: n }, (_, i) => `${tag} line ${i + 1}`).join('\n') + '\n';
+  const MONO: Commit[] = [
+    {
+      sha: HEAD,
+      files: {
+        'src/a.ts': blob(lines(10, 'ROOT a.ts')),
+        'src/rootonly.ts': blob(lines(5, 'ROOT only')),
+        'packages/api/src/a.ts': blob(lines(3, 'API a.ts')),
+        'packages/api/src/cwdonly.ts': blob(lines(5, 'API only')),
+        lib: blob(lines(5, 'ROOT lib')),
+        'packages/api/lib': TREE,
+        'packages/api/lib/x.ts': blob('x\n'),
+      },
+    },
+  ];
+  const below = (layout: { prefix: string; top: string } | null = { prefix: 'packages/api/', top: TOP }) => {
+    const h = harness(MONO);
+    h.layout = layout;
+    return h;
+  };
+  const objects = (h: ReturnType<typeof harness>, sub: string) => h.calls.filter((c) => c.args[2] === sub || c.args[3] === sub).map((c) => c.args.at(-1));
+
+  it('asks git once where the checkout is, after the commit is known, and never for a commit that does not exist', async () => {
+    const h = below();
+    await ground(h, 'src/a.ts:1');
+    expect(h.calls.map((c) => c.args.slice(2, 4))).toStrictEqual([['rev-parse', '--verify'], ['rev-parse', '--show-prefix'], ['cat-file', '-t'], ['cat-file', '-s'], ['show', `${HEAD}:packages/api/src/a.ts`]]);
+    const none = below();
+    await ground(none, 'src/a.ts:1@deadbee');
+    expect(none.calls).toHaveLength(1);
+  });
+
+  it('a file in the checkout and a file of the same name at the root: the checkout wins, and a line only the root file has is not grounded', async () => {
+    const h = below();
+    expect(await ground(h, 'src/a.ts:2')).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+    expect(objects(h, 'show')).toStrictEqual([`${HEAD}:packages/api/src/a.ts`]);
+    // the root file has ten lines, the agent's own has three: grounding line 8 against the root file would be grounding a different file
+    expect(await ground(h, 'src/a.ts:8')).toStrictEqual(bad('lines 8-8 are beyond the end of the file (3 lines)'));
+    expect(await ground(h, 'src/a.ts:2 "API a.ts line 2"')).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+    expect(await ground(h, 'src/a.ts:2 "ROOT a.ts line 2"')).toStrictEqual(bad('quote not found in lines 2-2'));
+    expect(objects(h, 'show').every((o) => o === `${HEAD}:packages/api/src/a.ts`)).toBe(true);
+  });
+
+  it('only the root has the file: the root path is the fallback, and that file is the one read', async () => {
+    const h = below();
+    expect(await ground(h, 'src/rootonly.ts:5')).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+    expect(objects(h, 'cat-file')).toStrictEqual([`${HEAD}:packages/api/src/rootonly.ts`, `${HEAD}:src/rootonly.ts`, `${HEAD}:src/rootonly.ts`]);
+    expect(objects(h, 'show')).toStrictEqual([`${HEAD}:src/rootonly.ts`]);
+  });
+
+  it('only the checkout has the file: grounded at once, with no look at the root', async () => {
+    const h = below();
+    expect(await ground(h, 'src/cwdonly.ts:5')).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+    expect(objects(h, 'cat-file')).toStrictEqual([`${HEAD}:packages/api/src/cwdonly.ts`, `${HEAD}:packages/api/src/cwdonly.ts`]);
+  });
+
+  it('neither has it: both are tried, and the cite is ungrounded', async () => {
+    const h = below();
+    expect(await ground(h, 'src/none.ts:1')).toStrictEqual(bad('src/none.ts is not in 75c7b13'));
+    expect(objects(h, 'cat-file')).toStrictEqual([`${HEAD}:packages/api/src/none.ts`, `${HEAD}:src/none.ts`]);
+  });
+
+  it('a name that exists in the checkout but is not a file is that answer: no fallback to a root file of the same name', async () => {
+    const h = below();
+    expect(await ground(h, 'lib:1')).toStrictEqual(bad('lib is not a file'));
+    expect(objects(h, 'cat-file')).toStrictEqual([`${HEAD}:packages/api/lib`]);
+  });
+
+  it('a "./" path says "from here": it is the checkout\'s file only, spelled with and without "./" alike', async () => {
+    const h = below();
+    expect(await ground(h, './src/a.ts:2')).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+    expect(await ground(h, './src/a.ts:8')).toStrictEqual(bad('lines 8-8 are beyond the end of the file (3 lines)'));
+    expect(await ground(h, './src/rootonly.ts:1')).toStrictEqual(bad('./src/rootonly.ts is not in 75c7b13'));
+    expect(await ground(h, './././src/cwdonly.ts:1')).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+    expect(h.calls.flatMap((c) => c.args).filter((a) => a.includes('./'))).toStrictEqual([]);
+  });
+
+  it('a checkout at the root has one reading, and git is not asked twice', async () => {
+    const h = below({ prefix: '', top: TOP });
+    expect(await ground(h, 'src/rootonly.ts:5')).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+    expect(await ground(h, 'src/none.ts:1')).toStrictEqual(bad('src/none.ts is not in 75c7b13'));
+    expect(objects(h, 'cat-file')).toStrictEqual([`${HEAD}:src/rootonly.ts`, `${HEAD}:src/rootonly.ts`, `${HEAD}:src/none.ts`]);
+  });
+
+  it('when git cannot say where the checkout is, the path is a repo path, as it was before', async () => {
+    const h = below(null);
+    expect(await ground(h, 'src/a.ts:8')).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+    expect(objects(h, 'show')).toStrictEqual([`${HEAD}:src/a.ts`]);
+  });
+
+  it.each([
+    ['no top', ''],
+    ['a top that is not absolute', 'packages/api/\nrepo\n'],
+    ['a prefix that does not end in a slash', 'packages/api\n/repo\n'],
+    ['an absolute prefix', '/packages/api/\n/repo\n'],
+    ['nothing', ''],
+  ])('an answer that is not a prefix and an absolute top (%s) is no answer: repo paths again', async (_name, out) => {
+    const h = below();
+    h.hooks.set('layout', () => ({ code: 0, stdout: out, stderr: '' }));
+    expect(await ground(h, 'src/a.ts:8')).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+    expect(objects(h, 'show')).toStrictEqual([`${HEAD}:src/a.ts`]);
+  });
+
+  it('CRLF output is read the same', async () => {
+    const h = below();
+    h.hooks.set('layout', () => ({ code: 0, stdout: `packages/api/\r\n${TOP}\r\n`, stderr: '' }));
+    expect(await ground(h, 'src/a.ts:8')).toStrictEqual(bad('lines 8-8 are beyond the end of the file (3 lines)'));
+  });
+
+  describe('absolute paths', () => {
+    it('one inside the repo is the repo path, read as it stands: not through the checkout, and git is never given an absolute path', async () => {
+      const h = below();
+      expect(await ground(h, `${TOP}/src/a.ts:8`)).toStrictEqual({ status: 'grounded', sha: '75c7b13' }); // the root file, named outright
+      expect(await ground(h, `${TOP}/packages/api/src/a.ts:3`)).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+      expect(await ground(h, `${TOP}/packages/api/src/a.ts:4`)).toStrictEqual(bad('lines 4-4 are beyond the end of the file (3 lines)'));
+      expect(objects(h, 'show')).toStrictEqual([`${HEAD}:src/a.ts`, `${HEAD}:packages/api/src/a.ts`, `${HEAD}:packages/api/src/a.ts`]);
+      for (const c of h.calls) for (const a of c.args.slice(2)) expect(a.startsWith('/')).toBe(false);
+      for (const a of h.calls.flatMap((c) => c.args)) expect(a.includes(`${TOP}/`)).toBe(false);
+    });
+
+    it('a path that is not under the top is outside the repository, whatever it names, and no object is looked up', async () => {
+      const h = below();
+      for (const text of ['/etc/passwd:1', `${TOP}:1`, `${TOP}/:1`, '/repository/src/a.ts:1', '/:1', `/other${TOP}/src/a.ts:1`]) {
+        expect(await ground(h, text), text).toStrictEqual(bad('outside the repository'));
+      }
+      expect(h.subs().filter((s) => s.startsWith('cat-file') || s === 'show')).toStrictEqual([]);
+    });
+
+    it('with no layout there is no repo to be inside of', async () => {
+      const h = below(null);
+      expect(await ground(h, `${TOP}/src/a.ts:1`)).toStrictEqual(bad('outside the repository'));
+      expect(h.subs()).toStrictEqual(['rev-parse']);
+    });
+
+    it('a hand-built cite with an absolute path is judged the same way', async () => {
+      const h = below();
+      const cite: Cite = { raw: `${TOP}/src/a.ts:1`, path: `${TOP}/src/a.ts`, startLine: 1, endLine: 1 };
+      expect(await groundCite(h.run, DIR, cite)).toStrictEqual({ status: 'grounded', sha: '75c7b13' });
+      expect(await groundCite(h.run, DIR, { ...cite, path: '/etc/passwd' })).toStrictEqual(bad('outside the repository'));
+    });
   });
 });
 
@@ -519,7 +742,6 @@ describe('groundCite: nothing hostile reaches git', () => {
     ['an option as the path', { path: '-x' }],
     ['a long option as the path', { path: '--output=/tmp/pwn' }],
     ['a dash as the path', { path: '-' }],
-    ['an absolute path', { path: '/etc/passwd' }],
     ['a parent path', { path: '../x' }],
     ['a parent in the middle', { path: 'src/../../x' }],
     ['a trailing parent', { path: 'src/..' }],
@@ -564,12 +786,14 @@ describe('groundCite: nothing hostile reaches git', () => {
   });
 
   // The only options the module passes itself. Everything else it hands over is a directory, or a <full sha>:<path> object.
-  const OWN_FLAGS = new Set(['-C', '-t', '-s', '--verify', '--quiet']);
+  const OWN_FLAGS = new Set(['-C', '-t', '-s', '--verify', '--quiet', '--show-prefix', '--show-toplevel']);
 
   it('no argv element starts with "-" except the flags the module itself passes', async () => {
     const h = harness();
     const texts = [
       'src/session.ts:2-3@75c7b13',
+      '/work/shop-app/src/session.ts:5',
+      '/etc/passwd:1',
       'src/session.ts:5',
       'src/session.ts:5 "reuse the session"',
       'src/session.ts:1@deadbee',
@@ -598,7 +822,7 @@ describe('groundCite: nothing hostile reaches git', () => {
     for (const c of h.calls) {
       expect(c.cmd).toBe('git');
       expect(c.args.slice(0, 2)).toStrictEqual(['-C', DIR]);
-      expect(c.opts).toStrictEqual({ timeoutMs: 20_000 });
+      expect(c.opts).toStrictEqual(c.args[2] === 'show' ? { timeoutMs: 20_000, maxOutputBytes: MB2 + 1 } : { timeoutMs: 20_000 });
       // every object handed to git is a full commit sha, a colon, then the path
       for (const a of c.args.slice(2)) if (a.includes(':') && !a.endsWith('^{commit}')) expect(a).toMatch(/^[0-9a-f]{40}:[^-]/);
     }
@@ -607,7 +831,7 @@ describe('groundCite: nothing hostile reaches git', () => {
   it('for any text the parser accepts, git only ever sees its own flags', async () => {
     const citeish = fc
       .tuple(
-        fc.constantFrom('', '-', 'src/', 'node_modules/@scope/pkg/', 'docs/', 'assets/'),
+        fc.constantFrom('', '-', 'src/', 'node_modules/@scope/pkg/', 'docs/', 'assets/', '/', '/work/shop-app/src/', '/work/shop-app/', '/etc/'),
         fc.constantFrom('session.ts', 'new.ts', 'index.js', 'huge.log', 'logo.bin', 'x', '--x'),
         fc.constantFrom(':1', ':5', ':1-8', ':9', ':3-2', ':0'),
         fc.constantFrom('', '@75c7b13', '@1a2b3c4', '@deadbee', '@-abc1234', '@HEAD'),
@@ -620,6 +844,8 @@ describe('groundCite: nothing hostile reaches git', () => {
         const cite = parseCite(text);
         if (cite) await groundCite(h.run, DIR, cite);
         for (const c of h.calls) for (const a of c.args) if (a.startsWith('-')) expect(OWN_FLAGS.has(a)).toBe(true);
+        // and an object is a full sha and a repo path: an absolute path never gets that far
+        for (const c of h.calls) for (const a of c.args.slice(2)) if (/^[0-9a-f]{40}:/.test(a)) expect(a.slice(41).startsWith('/')).toBe(false);
       }),
       { numRuns: 300 }
     );

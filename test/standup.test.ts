@@ -1,4 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import fc from 'fast-check';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { buildStandup, orderLightningRows, renderStandupText, standupWindow, type BoardItem, type Lane, type SessionActivity, type Standup, type StandupDeps, type StandupOptions } from '../src/standup.js';
 import type { Agent } from '../src/agent.js';
 import type { RunOptions, RunResult, Runner } from '../src/runner.js';
@@ -264,6 +268,7 @@ describe('the local git source', () => {
       ['-C', '/work/billing', 'for-each-ref', '--sort=-committerdate', '--format=%(refname)%09%(committerdate:unix)%09%(objectname:short)%09%(subject)', 'refs/heads', 'refs/remotes'],
     ]);
     expect(reads.every((c) => c.cmd === 'git' && c.opts?.timeoutMs === 20_000)).toBe(true);
+    expect(reads.map((c) => c.opts)).toEqual([{ timeoutMs: 20_000, maxOutputBytes: 4 * 1024 * 1024 }, { timeoutMs: 20_000, maxOutputBytes: 4 * 1024 * 1024 }]); // the runner stops reading there
     expect(startedBeforeFirstEnd('for-each-ref')).toBe(2);
     expect(calls.every((c) => c.cmd === 'git')).toBe(true);
   });
@@ -381,6 +386,18 @@ describe('the local git source', () => {
     expect(titles(justUnder.standup, 'triage')).toEqual(['feat/newest']);
   });
 
+  it('a listing the runner cut at the cap is unreadable too, whatever prefix of it came back, and does not hide the repo that read fine', async () => {
+    const cut: RunResult = { code: 1, stdout: refs(head('feat/newest', mon(10))), stderr: '', truncated: true };
+    const one = await build({ refs: { [SHOP.path]: cut } });
+    expect(chipOf(one.standup, 'git')).toEqual({ id: 'git', label: 'Local git', count: 0, note: 'git unavailable' });
+    expect(titles(one.standup, 'triage')).toEqual([]);
+    const two = await build({ refs: { [SHOP.path]: cut, [BILLING.path]: refs(head('feat/billing', mon(11))) } }, { deps: { repos: [SHOP, BILLING] } });
+    expect(chipOf(two.standup, 'git')).toEqual({ id: 'git', label: 'Local git', count: 1, note: 'git unavailable in 1 of 2 repos' });
+    // a code of 0 does not make a cut listing whole
+    const zero = await build({ refs: { [SHOP.path]: { ...cut, code: 0 } } });
+    expect(chipOf(zero.standup, 'git')?.note).toBe('git unavailable');
+  });
+
   it('a repo with no refs in the window is a genuine zero, with no note', async () => {
     const { standup } = await build({ refs: { [SHOP.path]: refs(head('older', local(2026, 10, 1))) } });
     expect(chipOf(standup, 'git')).toEqual({ id: 'git', label: 'Local git', count: 0 });
@@ -388,16 +405,63 @@ describe('the local git source', () => {
 });
 
 describe('ticket keys', () => {
-  it('finds ABC-123 in the branch name and the commit subject, uppercased, in order of appearance', async () => {
+  it('finds ABC-123 in the branch name and the commit subject, in order of appearance', async () => {
     const { standup } = await build({
       refs: {
-        [SHOP.path]: refs(head('feat/shop-142-retry', mon(16), 'also touches PAY-9'), head('cleanup', mon(15), 'drop the flag (shop-77)'), head('plain-branch', mon(14), 'no ticket here'), head('shop-142abc', mon(13), 'glued to letters')),
+        [SHOP.path]: refs(head('feat/SHOP-142-retry', mon(16), 'also touches PAY-9'), head('cleanup', mon(15), 'drop the flag (SHOP-77)'), head('plain-branch', mon(14), 'no ticket here'), head('SHOP-142abc', mon(13), 'glued to letters')),
       },
     });
-    expect(item(standup, 'branch:shop-app:SHOP-142')).toMatchObject({ title: 'feat/shop-142-retry', refs: ['SHOP-142', 'PAY-9'] });
+    expect(item(standup, 'branch:shop-app:SHOP-142')).toMatchObject({ title: 'feat/SHOP-142-retry', refs: ['SHOP-142', 'PAY-9'] });
     expect(item(standup, 'branch:shop-app:SHOP-77')).toMatchObject({ title: 'cleanup', refs: ['SHOP-77'] });
     expect(item(standup, 'branch:shop-app:plain-branch').refs).toEqual([]);
-    expect(item(standup, 'branch:shop-app:shop-142abc').refs).toEqual([]); // the digits run into letters: not a key
+    expect(item(standup, 'branch:shop-app:SHOP-142abc').refs).toEqual([]); // the digits run into letters: not a key
+  });
+
+  it('a hyphenated key must be written in capitals, unless its prefix is configured: lowercase words with a number are not tickets', async () => {
+    const world = { refs: { [SHOP.path]: refs(head('feat/shop-142-retry', mon(16), 'also touches pay-9'), head('Feat/Shop-77', mon(15), 'mixed case')) } };
+    const without = await build(world);
+    expect(without.standup.board.map((i) => i.refs)).toEqual([[], []]);
+    expect(without.standup.lanes.triage).toBe(2);
+    const configured = await build(world, { opts: { ticketPrefixes: ['SHOP'] } }); // any case, once the prefix is named
+    expect(item(configured.standup, 'branch:shop-app:SHOP-142')).toMatchObject({ title: 'feat/shop-142-retry', refs: ['SHOP-142'] });
+    expect(item(configured.standup, 'branch:shop-app:SHOP-77')).toMatchObject({ title: 'Feat/Shop-77', refs: ['SHOP-77'] });
+  });
+
+  it('words and versions with a hyphen and a number do not merge unrelated branches', async () => {
+    const t = mon(10);
+    const names = ['fix/utf-8-bom', 'feat/utf-8-output', 'fix/off-by-1', 'feat/release-2026', 'chore/release-2027', 'fix/sha-256-hash', 'chore/node-18-upgrade', 'chore/node-20-upgrade'];
+    const { standup } = await build({ refs: { [SHOP.path]: refs(...names.map((n, i) => head(n, t - i * 1000))) } });
+    expect(lane(standup, 'triage')).toHaveLength(names.length);
+    expect(lane(standup, 'triage').every((i) => i.refs.length === 0 && !i.detail)).toBe(true); // nothing was merged, so there is no "+N more"
+    expect(standup.lanes.triage).toBe(names.length);
+  });
+
+  it('a session whose name has a lowercase word-and-number joins nothing', async () => {
+    const world = { refs: { [SHOP.path]: refs(head('feat/retry-3-cleanup', mon(15)), head('feat/RETRY-3-other', mon(14))) } };
+    const agents = [agent('A1', { name: 'retry-3 cleanup', cwd: '/work/shop-app' })];
+    const { standup } = await build(world, { deps: { agents } });
+    expect(lane(standup, 'triage').map((i) => [i.title, i.sessionIDs, i.tint])).toEqual([
+      ['feat/retry-3-cleanup', undefined, 'blue'],
+      ['feat/RETRY-3-other', undefined, 'blue'],
+    ]);
+  });
+
+  it('prefixes that are never tickets make no key, written in capitals or configured: UTF-8, SHA-256, CVE-2021-44228 and the like', async () => {
+    const t = mon(10);
+    const subjects = ['Fix UTF-8 handling', 'use SHA-256', 'ISO-8601 dates', 'RFC-2119 words', 'AES-128 keys', 'RSA-2048 keys', 'TLS-13 only', 'SSL-3 off', 'HTTP-2 on', 'HTTPS-443', 'WCAG-22 pass', 'IPV-6 ready', 'MD-5 gone', 'X-86 port', 'V-8 engine', 'Fix CVE-2021-44228'];
+    const world = { refs: { [SHOP.path]: refs(...subjects.map((sub, i) => head(`b${i}`, t - i * 1000, sub))) } };
+    const plain = await build(world);
+    expect(plain.standup.board.map((i) => i.refs)).toEqual(subjects.map(() => []));
+    expect(plain.standup.lanes.triage).toBe(subjects.length);
+    const configured = await build(world, { opts: { ticketPrefixes: ['utf', 'sha', 'iso', 'cve', 'x', 'v', 'http'] } });
+    expect(configured.standup.board.map((i) => i.refs)).toEqual(subjects.map(() => []));
+    const unhyphenated = await build({ refs: { [SHOP.path]: refs(head('feat/utf8-sha256-v8-x86', t)) } }, { opts: { ticketPrefixes: ['utf', 'sha', 'v', 'x'] } });
+    expect(unhyphenated.standup.board[0].refs).toEqual([]);
+  });
+
+  it('a prefix near a denied one is a ticket: only the exact names are denied', async () => {
+    const { standup } = await build({ refs: { [SHOP.path]: refs(head('feat/UTFX-8', mon(10)), head('feat/SHAKE-2', mon(9)), head('feat/ISOS-1', mon(8))) } });
+    expect(standup.board.map((i) => i.refs)).toEqual([['UTFX-8'], ['SHAKE-2'], ['ISOS-1']]);
   });
 
   it('reads the unhyphenated form only for a configured prefix, case-insensitively', async () => {
@@ -437,7 +501,12 @@ describe('ticket keys', () => {
     const world = { refs: { [SHOP.path]: refs(head('feat/sha256-utf8-fix', mon(10), 'use sha256 and utf8 everywhere')) } };
     expect((await build(world)).standup.board[0].refs).toEqual([]);
     expect((await build(world, { opts: { ticketPrefixes: ['shop'] } })).standup.board[0].refs).toEqual([]);
-    expect((await build(world, { opts: { ticketPrefixes: ['sha'] } })).standup.board[0].refs).toEqual(['SHA-256']);
+    // naming a prefix is what makes the unhyphenated form a key
+    const node = { refs: { [SHOP.path]: refs(head('chore/node18-upgrade', mon(10)), head('chore/node20-upgrade', mon(9))) } };
+    expect((await build(node)).standup.board.map((i) => i.refs)).toEqual([[], []]);
+    expect((await build(node, { opts: { ticketPrefixes: ['node'] } })).standup.board.map((i) => i.refs)).toEqual([['NODE-18'], ['NODE-20']]);
+    // ... except for the prefixes that are never tickets
+    expect((await build(world, { opts: { ticketPrefixes: ['sha'] } })).standup.board[0].refs).toEqual([]);
   });
 
   it('a prefix is a literal, not a pattern: metacharacters are escaped and blank prefixes are ignored', async () => {
@@ -571,7 +640,9 @@ describe('the triage join', () => {
       agent('nokey', { name: 'general helper', cwd: '/work/shop-app' }),
     ];
     const { standup } = await build(world, { deps: { agents } });
-    expect(standup.board[0].sessionIDs).toEqual(['exact', 'lower']);
+    expect(standup.board[0].sessionIDs).toEqual(['exact']); // "shop-142" in lowercase is a word and a number, not a key
+    const named = await build(world, { deps: { agents }, opts: { ticketPrefixes: ['shop'] } });
+    expect(named.standup.board[0].sessionIDs).toEqual(['exact', 'lower']); // unless the prefix is named
   });
 
   it('joins the unhyphenated ticket in a session name only when the prefix is configured', async () => {
@@ -670,6 +741,78 @@ describe('the triage join', () => {
       expect(c.args[1]).toMatch(/^\//);
     }
     expect(calls.some((c) => c.args[2] === 'rev-parse')).toBe(false);
+  });
+});
+
+describe('grouping branches by ticket key', () => {
+  /** What an item stands for: how many branches it merged and the keys they carry. */
+  const shape = (i: BoardItem) => `${i.repo}:${i.detail?.match(/^\+(\d+) more$/) ? Number(i.detail.match(/^\+(\d+) more$/)?.[1]) + 1 : 1}:${[...i.refs].sort().join(',')}`;
+
+  it('20 000 branches without a key, or each with a key of its own, are 20 000 items, and the standup returns in a fraction of the time it took when every branch scanned every group', async () => {
+    const at = mon(10);
+    for (const subject of [(i: number) => `subject ${i}`, (i: number) => `PRJ${i}-1 subject`]) {
+      const lines = Array.from({ length: 20_000 }, (_, i) => head(`b${i}`, at - i * 1000, subject(i)));
+      const started = Date.now();
+      const { standup } = await build({ refs: { [SHOP.path]: refs(...lines) } });
+      const took = Date.now() - started;
+      expect(standup.lanes.triage).toBe(20_000);
+      expect(chipOf(standup, 'git')?.count).toBe(20_000);
+      expect(took).toBeLessThan(1500);
+    }
+  });
+
+  it('20 000 branches in chains of shared keys merge into their chains, in the same time', async () => {
+    const at = mon(10);
+    // branch i carries the keys KEY<i/2>-1 and KEY<i/2+1>-1, so every branch is linked to the next: one chain of 20 000
+    const lines = Array.from({ length: 20_000 }, (_, i) => head(`b${i}`, at - i * 1000, `KEY${Math.floor(i / 2)}-1 KEY${Math.floor(i / 2) + 1}-1`));
+    const started = Date.now();
+    const { standup } = await build({ refs: { [SHOP.path]: refs(...lines) } });
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(standup.lanes.triage).toBe(1);
+    expect(standup.board[0].detail).toBe('+19999 more');
+  });
+
+  it('branches that share a key merge through a third, and keys of different repos never join', async () => {
+    const lines = (...l: string[]) => refs(...l);
+    const { standup } = await build(
+      {
+        refs: {
+          [SHOP.path]: lines(head('a', mon(20), 'AB-1'), head('b', mon(19), 'CD-2'), head('c', mon(18), 'AB-1 CD-2'), head('d', mon(17), 'EF-3'), head('e', mon(16))),
+          [BILLING.path]: lines(head('f', mon(15), 'AB-1'), head('g', mon(14), 'EF-3')),
+        },
+      },
+      { deps: { repos: [SHOP, BILLING] } }
+    );
+    expect(lane(standup, 'triage').map(shape).sort()).toEqual(['billing:1:AB-1', 'billing:1:EF-3', 'shop-app:1:', 'shop-app:1:EF-3', 'shop-app:3:AB-1,CD-2'].sort());
+  });
+
+  it('the group is titled by its newest branch whichever order the branches were read in, and equal times keep the order they were listed in', async () => {
+    const t = mon(12);
+    const { standup } = await build({ refs: { [SHOP.path]: refs(head('first', t, 'TK-1'), head('second', t, 'TK-1'), head('third', t, 'TK-1')) } });
+    expect(standup.board[0]).toMatchObject({ id: 'branch:shop-app:TK-1', title: 'first', detail: '+2 more' });
+    const newer = await build({ refs: { [SHOP.path]: refs(head('old', mon(9), 'TK-2'), head('new', mon(14), 'TK-2')) } });
+    expect(newer.standup.board[0]).toMatchObject({ title: 'new', detail: '+1 more' });
+  });
+
+  it('forms the same groups as a branch-by-branch scan on any mix of keyed and unkeyed branches (property)', async () => {
+    const keys = ['AA-1', 'BB-2', 'CC-3', 'DD-4', 'EE-5'];
+    const branch = fc.record({ repo: fc.constantFrom(0, 1), keys: fc.subarray(keys, { maxLength: 3 }) });
+    await fc.assert(
+      fc.asyncProperty(fc.array(branch, { maxLength: 30 }), async (bs) => {
+        const repos = [SHOP, BILLING];
+        const byRepo = (r: number) => refs(...bs.flatMap((b, i) => (b.repo === r ? [head(`b${i}`, mon(10) - i * 1000, b.keys.join(' '))] : [])));
+        const { standup } = await build({ refs: { [SHOP.path]: byRepo(0), [BILLING.path]: byRepo(1) } }, { deps: { repos } });
+        // the reference: connected components of "shares a key within a repo"
+        const parent = bs.map((_, i) => i);
+        const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+        bs.forEach((a, i) => bs.forEach((b, j) => a.repo === b.repo && a.keys.some((k) => b.keys.includes(k)) && (parent[find(i)] = find(j))));
+        const comps = new Map<number, number[]>();
+        bs.forEach((_, i) => comps.set(find(i), [...(comps.get(find(i)) ?? []), i]));
+        const expected = [...comps.values()].map((m) => `${repos[bs[m[0]].repo].name}:${m.length}:${[...new Set(m.flatMap((i) => bs[i].keys))].sort().join(',')}`);
+        expect(lane(standup, 'triage').map(shape).sort()).toEqual(expected.sort());
+      }),
+      { numRuns: 100 }
+    );
   });
 });
 
@@ -844,6 +987,23 @@ describe('the sessions source', () => {
   });
 });
 
+describe('a session in a symlinked spelling of a repo', () => {
+  it('is found in its repo by the common git dir, because the repo is named by its real path', async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'agentim-standup-')));
+    try {
+      const real = join(base, 'real', 'proj');
+      mkdirSync(real, { recursive: true });
+      symlinkSync(join(base, 'real'), join(base, 'link'), 'dir');
+      const cwd = join(base, 'link', 'proj', 'sub'); // the agent's own spelling, outside the repo's real path
+      const proj: RepoRef = { name: 'proj', path: real };
+      const { standup } = await build({ common: { [cwd]: '../.git' } }, { deps: { repos: [proj], agents: [agent('A1', { cwd })] } });
+      expect(standup.board.find((i) => i.id === 'session:A1')).toMatchObject({ repo: 'proj' });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('the ledger source and the Lightning lane', () => {
   const uv = (id: string, over: object = {}) => ({ id, date: '2026-10-12', claim: 'offline uploads reuse the session id minted online', doubt: 'never checked against a cold start', ...over });
 
@@ -868,8 +1028,8 @@ describe('the ledger source and the Lightning lane', () => {
       rowKey: 'uv:shop-app:UV-0036',
       at: local(2026, 10, 12),
     });
-    expect(chipOf(standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 3 });
-    expect(standup.lanes.lightning).toBe(3);
+    expect(chipOf(standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 7 }); // every row read, closed or not
+    expect(standup.lanes.lightning).toBe(3); // the open ones
     expect(callsOf('show').map((c) => c.args)).toEqual([
       ['-C', '/work/shop-app', 'show', 'wiki:tombstones.jsonl'],
       ['-C', '/work/shop-app', 'show', 'wiki:unverified.jsonl'],
@@ -881,7 +1041,7 @@ describe('the ledger source and the Lightning lane', () => {
     expect(standup.board[0]).toStrictEqual({ id: 'uv:shop-app:UV-9', lane: 'lightning', title: 'UV-9', repo: 'shop-app', state: 'open', tint: 'green', refs: [], sources: ['ledger'], rowKey: 'uv:shop-app:UV-9' });
   });
 
-  it('rows the decision store hides leave both the lane and the chip, and the callback gets the row key', async () => {
+  it('rows the decision store hides leave the lane but not the chip, and the callback gets the row key', async () => {
     const asked: string[] = [];
     const hidden = (key: string) => {
       asked.push(key);
@@ -889,7 +1049,7 @@ describe('the ledger source and the Lightning lane', () => {
     };
     const { standup } = await build({ files: ledger(SHOP, { unverified: jsonl(uv('UV-0036'), uv('UV-0037')) }) }, { opts: { hidden } });
     expect(lane(standup, 'lightning').map((i) => i.id)).toEqual(['uv:shop-app:UV-0037']);
-    expect(chipOf(standup, 'ledger')?.count).toBe(1);
+    expect(chipOf(standup, 'ledger')?.count).toBe(2);
     expect(standup.lanes.lightning).toBe(1);
     expect(asked).toContain('uv:shop-app:UV-0036');
     expect(asked).toContain('uv:shop-app:UV-0037');
@@ -922,9 +1082,56 @@ describe('the ledger source and the Lightning lane', () => {
   it('no ledger in any repo is a note, not a silent zero', async () => {
     const { standup } = await build({}, { deps: { repos: [SHOP, BILLING] } });
     expect(chipOf(standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 0, note: 'no ledger' });
-    // a ledger that exists but holds only closed rows is a real zero
+    // a ledger that exists but holds only closed rows has nothing to open: the chip counts the row it read, the lane is a real zero, and there is no note
     const closed = await build({ files: ledger(SHOP, { unverified: jsonl(uv('UV-1', { status: 'closed' })) }) });
-    expect(chipOf(closed.standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 0 });
+    expect(chipOf(closed.standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 1 });
+    expect(closed.standup.lanes.lightning).toBe(0);
+  });
+
+  it('the Ledger chip counts every row read and the Lightning lane the open un-hidden ones, like the photo (101 and 98)', async () => {
+    const open = Array.from({ length: 6 }, (_, i) => uv(`UV-${i + 1}`));
+    const closed = [uv('UV-7', { status: 'settled' }), uv('UV-8', { status: 'Denied' }), uv('UV-9', { superseded_by: 'UV-1' })];
+    const hiddenKeys = new Set(['uv:shop-app:UV-1', 'uv:shop-app:UV-2']);
+    const { standup } = await build(
+      { files: ledger(SHOP, { unverified: jsonl(...open, ...closed), tombstones: jsonl({ id: 'TB-1', claim: 'a', status: 'closed' }) }) },
+      { opts: { hidden: (key) => hiddenKeys.has(key) } }
+    );
+    expect(chipOf(standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 10 });
+    expect(standup.lanes.lightning).toBe(4);
+    expect(lane(standup, 'lightning').map((i) => i.id).sort()).toEqual(['uv:shop-app:UV-3', 'uv:shop-app:UV-4', 'uv:shop-app:UV-5', 'uv:shop-app:UV-6']);
+    expect(renderStandupText(standup)).toContain('Ledger 10 ');
+    expect(renderStandupText(standup)).toContain('Lightning 4');
+  });
+
+  it('a file too large to read, or git timing out on one, is a note on the chip; the rows of the other file still count', async () => {
+    const big: RunResult = { code: 1, stdout: 'partial', stderr: '', truncated: true };
+    const slow: RunResult = { code: 1, stdout: '', stderr: '', timedOut: true };
+    const files = (tombstones: Answer) => ({ [`${SHOP.path}|wiki:tombstones.jsonl`]: tombstones, ...ledger(SHOP, { unverified: jsonl(uv('UV-1'), uv('UV-2')) }) });
+    const tooBig = await build({ files: files(big) });
+    expect(chipOf(tooBig.standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 2, note: 'tombstones.jsonl is larger than 2 MiB' });
+    expect(tooBig.standup.lanes.lightning).toBe(2);
+    const timedOut = await build({ files: files(slow) });
+    expect(chipOf(timedOut.standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 2, note: 'git timed out reading tombstones.jsonl' });
+    // a file that is merely not there says nothing
+    const absent = await build({ files: files(fail()) });
+    expect(chipOf(absent.standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 2 });
+    expect(renderStandupText(tooBig.standup)).toContain('Ledger 2 (tombstones.jsonl is larger than 2 MiB)');
+  });
+
+  it('an unreadable ledger is its own note, not "no ledger"; with several repos the note names the repo, and a fine repo beside it adds nothing', async () => {
+    const big: RunResult = { code: 1, stdout: '', stderr: '', truncated: true };
+    const only = await build({ files: { [`${SHOP.path}|wiki:unverified.jsonl`]: big } });
+    expect(chipOf(only.standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 0, note: 'unverified.jsonl is larger than 2 MiB' });
+    const two = await build({ files: { [`${SHOP.path}|wiki:unverified.jsonl`]: big, ...ledger(BILLING, { unverified: jsonl(uv('UV-1')) }) } }, { deps: { repos: [SHOP, BILLING] } });
+    expect(chipOf(two.standup, 'ledger')).toEqual({ id: 'ledger', label: 'Ledger', count: 1, note: 'shop-app: unverified.jsonl is larger than 2 MiB' });
+  });
+
+  it('asks git for each ledger file with the same cap the reader applies', async () => {
+    const { callsOf } = await build({ files: ledger(SHOP, { unverified: jsonl(uv('UV-1')) }) });
+    expect(callsOf('show').map((c) => c.opts)).toEqual([
+      { timeoutMs: 20_000, maxOutputBytes: 2 * 1024 * 1024 },
+      { timeoutMs: 20_000, maxOutputBytes: 2 * 1024 * 1024 },
+    ]);
   });
 
   it('orders the lane: rows dated inside the window first, then the rest, oldest first, undated last', async () => {

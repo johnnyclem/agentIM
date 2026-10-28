@@ -8,6 +8,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { Hub, type HubEvent } from './hub.js';
+import { StaleCardError } from './lightning.js';
 import { parseStatusReport } from './status-report.js';
 import { terminalTooltip } from './spawner.js';
 import type { Letter } from './lightning-format.js';
@@ -64,6 +65,14 @@ function lightningOptions(body: Record<string, unknown>): { keys?: string[]; rep
   if (keys !== undefined && !(Array.isArray(keys) && keys.every((k) => typeof k === 'string'))) throw new HttpError(400, 'keys is an array of strings');
   if (panelSize !== undefined && !(typeof panelSize === 'number' && Number.isInteger(panelSize) && panelSize >= 0 && panelSize <= 12)) throw new HttpError(400, 'panelSize is a whole number from 0 to 12');
   return { keys: keys as string[] | undefined, repo: optStr(body, 'repo'), panelSize: panelSize as number | undefined };
+}
+
+/** A whole number from 0 up that may be left out; present but anything else is a 400. */
+function optCount(body: Record<string, unknown>, key: string): number | undefined {
+  const v = body[key];
+  if (v === undefined) return undefined;
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) throw new HttpError(400, `${key} is a whole number from 0 up`);
+  return v;
 }
 
 const report = (body: Record<string, unknown>): ReturnType<typeof parseStatusReport> => {
@@ -245,10 +254,12 @@ export function routes(hub: Hub): Route[] {
     r('GET', '/lightning', () => hub.lightningView()),
     r('POST', '/lightning/start', ({ body }) => hub.lightningStart(lightningOptions(body))),
     r('POST', '/lightning/select', ({ body }) => hub.lightningSelect(str(body, 'key'))),
+    // `rev` is the card's `rev` the caller saw; a card that has changed since is a 409 and nothing is sent. Without it the letter applies to the card as it is now.
     r('POST', '/lightning/approve', async ({ body }) => {
       const option = str(body, 'option');
       if (!/^[A-D]$/.test(option)) throw new HttpError(400, 'option is one of A, B, C, D');
-      return hub.lightningApprove(str(body, 'key'), option as Letter);
+      const rev = optCount(body, 'rev');
+      return hub.lightningApprove(str(body, 'key'), option as Letter, rev);
     }),
     r('POST', '/lightning/reject', ({ body }) => hub.lightningReject(str(body, 'key'))),
     r('POST', '/lightning/defer', ({ body }) => hub.lightningDefer(str(body, 'key'))),
@@ -356,6 +367,7 @@ export function handler(hub: Hub): (req: IncomingMessage, res: ServerResponse) =
       return send(404, { error: `no route ${req.method} ${url.pathname}` });
     } catch (err) {
       if (err instanceof HttpError) return send(err.status, { error: err.message });
+      if (err instanceof StaleCardError) return send(409, { error: err.message });
       const message = err instanceof Error ? err.message : String(err);
       // A bad date or a letter the card does not offer is the caller's mistake; an unknown thing is a 404.
       const bad = /^covering must be|^Option [A-D] is not offered/.test(message);

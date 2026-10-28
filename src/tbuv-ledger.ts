@@ -6,11 +6,12 @@
  * array. A repo with no ledger branch is normal, and a failure never throws.
  */
 
+import { realpath } from 'node:fs/promises';
 import { basename, dirname, resolve } from 'node:path';
 import type { Runner } from './runner.js';
 
 export const DEFAULT_LEDGER_REF = 'wiki';
-/** A ledger file larger than this (bytes of git output) is not read: it counts as unreadable, never as a silent prefix. */
+/** A ledger file larger than this (bytes of git output) is not read: git is killed at the cap, and the file is reported as too large, never read as a silent prefix. */
 export const MAX_LEDGER_BYTES = 2 * 1024 * 1024;
 
 const GIT_TIMEOUT_MS = 20_000;
@@ -48,10 +49,14 @@ export interface LedgerRow {
   raw: Record<string, unknown>;
 }
 
-/** `unavailable`: git could not run, or neither file could be read. */
+/**
+ * `unavailable`: git could not run, or neither file could be read.
+ * `note`: a file that was there but could not be read (over 2 MiB, git timed out); its rows are missing, which is not the same as an absent ledger.
+ */
 export interface LedgerRead {
   rows: LedgerRow[];
   unavailable: boolean;
+  note?: string;
 }
 
 const CLOSED_STATUSES = new Set(['settled', 'confirmed', 'denied', 'superseded', 'resolved', 'closed', 'done', 'wontfix', 'withdrawn']);
@@ -98,11 +103,24 @@ function ledgerDate(v: unknown): string | undefined {
   return undefined;
 }
 
-/** A row id: a non-blank string or a finite number (as the hub's lookup always read it), uppercased. */
+/** What an id may be: it is quoted into the agent prompts and the panel, so a space, a newline or a sentence in it is not an id. */
+const ROW_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/** A row id: a non-blank string or a finite number (as the hub's lookup always read it), uppercased; '' when it is not a plain identifier. */
 function rowId(v: unknown): string {
-  if (typeof v === 'string') return v.trim().toUpperCase();
-  if (typeof v === 'number' && Number.isFinite(v)) return String(v).toUpperCase(); // 1e21 reads as '1E+21', like every other id
-  return '';
+  const id = typeof v === 'string' ? v.trim().toUpperCase() : typeof v === 'number' && Number.isFinite(v) ? String(v).toUpperCase() : '';
+  return ROW_ID.test(id) ? id : '';
+}
+
+/** The row that closes this one: a non-blank string or a finite number, or the first such value of a list, from either spelling. */
+function supersederOf(o: Record<string, unknown>): string | undefined {
+  for (const k of ['superseded_by', 'supersededBy']) {
+    for (const v of Array.isArray(o[k]) ? o[k] : [o[k]]) {
+      const t = typeof v === 'number' && Number.isFinite(v) ? String(v) : text(v);
+      if (t !== undefined) return t;
+    }
+  }
+  return undefined;
 }
 
 /** One JSON object per line. Blank and malformed lines, and lines that are not objects, are skipped; the first row for an id wins. */
@@ -128,7 +146,7 @@ export function parseLedger(jsonl: string, kind: RowKind, repo: RepoRef): Ledger
     const doubt = text(raw.doubt);
     const settlesIt = firstText(raw, ['settles_it', 'settlesIt']);
     const raisedBy = firstText(raw, ['raised_by', 'raisedBy', 'skeptic', 'by']);
-    const supersededBy = firstText(raw, ['superseded_by', 'supersededBy']);
+    const supersededBy = supersederOf(raw);
     const status = text(raw.status)?.toLowerCase() ?? 'open';
     rows.push({
       key: `${prefix}:${repo.name}:${id}`,
@@ -155,29 +173,65 @@ function safeRef(ref: unknown): boolean {
   return typeof ref === 'string' && ref !== '' && !ref.startsWith('-') && !/[\s\0]/.test(ref);
 }
 
+/** What one ledger file gave: its rows, a note when it was there but could not be read, or null when git has no such file. */
+type FileRead = { rows: LedgerRow[] } | { note: string } | null;
+
 /**
  * Both ledger files of one repo, read concurrently: the tombstones first, then the unverified rows.
- * A file git cannot show (no ledger ref, not in it, over the size cap, git failing) has no rows; only when neither file could be read is the read `unavailable`.
+ * A file git cannot show (no ledger ref, not in it, git failing) has no rows, and a read is `unavailable` only when no file gave any.
+ * A file that is there but unreadable (over the size cap, which kills git early, or git timing out) also has no rows, but it is named in `note`: it is not an absent ledger.
  */
 export async function readLedger(run: Runner, repo: RepoRef, ref: string = DEFAULT_LEDGER_REF): Promise<LedgerRead> {
   if (!safeRef(ref) || repo.path === '' || repo.path.includes('\0')) return { rows: [], unavailable: true };
-  const read = async ({ kind, file }: (typeof LEDGER_FILES)[number]): Promise<LedgerRow[] | null> => {
+  const read = async ({ kind, file }: (typeof LEDGER_FILES)[number]): Promise<FileRead> => {
     try {
-      const r = await run('git', ['-C', repo.path, 'show', `${ref}:${file}`], { timeoutMs: GIT_TIMEOUT_MS });
-      if (r.code !== 0 || Buffer.byteLength(r.stdout) > MAX_LEDGER_BYTES) return null;
-      return parseLedger(r.stdout, kind, repo);
+      const r = await run('git', ['-C', repo.path, 'show', `${ref}:${file}`], { timeoutMs: GIT_TIMEOUT_MS, maxOutputBytes: MAX_LEDGER_BYTES });
+      if (r.timedOut) return { note: `git timed out reading ${file}` };
+      if (r.truncated) return { note: `${file} is larger than 2 MiB` };
+      if (r.code !== 0) return null;
+      if (Buffer.byteLength(r.stdout) > MAX_LEDGER_BYTES) return { note: `${file} is larger than 2 MiB` }; // a runner that does not cap its output
+      return { rows: parseLedger(r.stdout, kind, repo) };
     } catch {
-      return null; // git missing, a bad cwd or a timeout: the file reads as absent
+      return null; // git missing or a bad cwd: the file reads as absent
     }
   };
   const results = await Promise.all(LEDGER_FILES.map(read));
-  return { rows: results.flatMap((r) => r ?? []), unavailable: results.every((r) => r === null) };
+  const notes = [...new Set(results.flatMap((r) => (r !== null && 'note' in r ? [r.note] : [])))];
+  return {
+    rows: results.flatMap((r) => (r !== null && 'rows' in r ? r.rows : [])),
+    unavailable: results.every((r) => r === null || 'note' in r),
+    ...(notes.length > 0 && { note: notes.join('; ') }),
+  };
+}
+
+const byPath = (a: RepoRef, b: RepoRef) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+
+/**
+ * Repos that share a folder name would share row keys (`uv:app:UV-1`), so each of them is named `<parent folder>~<folder>`;
+ * when that still collides, `~2`, `~3` follow in path order. The names depend on the paths only, not on the order the repos were found in, and a name that is already unique is kept.
+ */
+export function uniqueRepoNames(repos: RepoRef[]): RepoRef[] {
+  const sharing = new Map<string, RepoRef[]>();
+  for (const r of repos) sharing.set(r.name, [...(sharing.get(r.name) ?? []), r]);
+  const names = new Map<RepoRef, string>();
+  for (const group of sharing.values()) {
+    if (group.length < 2) continue;
+    const used = new Map<string, number>();
+    for (const r of [...group].sort(byPath)) {
+      const base = `${basename(dirname(r.path))}~${r.name}`;
+      const n = (used.get(base) ?? 0) + 1;
+      used.set(base, n);
+      names.set(r, n === 1 ? base : `${base}~${n}`);
+    }
+  }
+  return repos.map((r) => (names.has(r) ? { ...r, name: names.get(r) as string } : r));
 }
 
 /**
  * The distinct repos behind a list of directories (agent working directories), first seen first.
  * `git rev-parse --git-common-dir` is relative to the directory for a main worktree and absolute for a linked one;
  * only a common dir named `.git` is a repo (its parent is the root), so worktrees of one repo collapse, and bare repos and submodule gitdirs are skipped.
+ * A root is compared by its real path, so a symlinked or differently spelled path is the same repo; two repos with one folder name get distinct names (`uniqueRepoNames`).
  */
 export async function discoverRepos(run: Runner, dirs: string[]): Promise<RepoRef[]> {
   const distinct = [...new Set(dirs.filter((d) => d.trim() !== ''))];
@@ -189,7 +243,9 @@ export async function discoverRepos(run: Runner, dirs: string[]): Promise<RepoRe
         const out = r.stdout.split('\n')[0].replace(/\r$/, '');
         if (out.trim() === '') return null;
         const common = resolve(dir, out);
-        return basename(common) === '.git' ? dirname(common) : null;
+        if (basename(common) !== '.git') return null;
+        const root = dirname(common);
+        return await realpath(root).catch(() => root); // a path that is not on this disk (or not readable) is compared as written
       } catch {
         return null; // git missing or a bad directory: not a repo as far as we can tell
       }
@@ -204,5 +260,5 @@ export async function discoverRepos(run: Runner, dirs: string[]): Promise<RepoRe
     seen.add(root);
     repos.push({ name, path: root });
   }
-  return repos;
+  return uniqueRepoNames(repos);
 }

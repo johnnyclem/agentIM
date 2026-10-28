@@ -13,17 +13,18 @@
  *   agentim volunteer <title> --description <text> [--requester NAME]
  *   agentim standup [--date YYYY-MM-DD] [--json]   the morning standup: what moved since the last working day
  *   agentim lightning start [--repo NAME] [--panel N] | show | abort
- *   agentim lightning approve <key> <A-D> | reject <key> | defer <key> | skeptics <key>
+ *   agentim lightning approve <key> <A-D> [--rev N] | reject <key> | defer <key> | skeptics <key>
  *   agentim pause | resume | done <agent> | rename <agent> <name> | terminal <agent> | model <agent> <id>
  *   agentim spawn <name> --cwd DIR --prompt TEXT [--model ID]
  *   agentim ack <canary-id>                   the acknowledgment an agent's first tool call makes
  *   agentim hook session-start | pre-tool-use Claude Code hook entry points (JSON on stdin)
  *
- * <agent> is a session id, its 8-character prefix, or a name. Every command
+ * A flag takes its value as `--flag value` or `--flag=value`. <agent> is a session id, its 8-character prefix, or a name. Every command
  * but serve/ack talks to the daemon at $AGENTIM_URL (default http://127.0.0.1:7433).
  */
 
 import { readFileSync } from 'node:fs';
+import { parseArgs } from './args.js';
 import { Hub } from './hub.js';
 import { demoHub } from './demo.js';
 import { serve, DEFAULT_PORT } from './daemon.js';
@@ -32,23 +33,6 @@ import type { Agent } from './agent.js';
 import type { PermissionMode } from './spawner.js';
 
 const BASE = process.env.AGENTIM_URL ?? `http://127.0.0.1:${DEFAULT_PORT}`;
-
-function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string[]> } {
-  const positional: string[] = [];
-  const flags: Record<string, string[]> = {};
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a.startsWith('--')) {
-      const key = a.slice(2);
-      const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--')) {
-        (flags[key] ??= []).push(next);
-        i++;
-      } else (flags[key] ??= []).push('true');
-    } else positional.push(a);
-  }
-  return { positional, flags };
-}
 
 async function api(method: string, path: string, body?: unknown): Promise<unknown> {
   const res = await fetch(BASE + path, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -146,9 +130,14 @@ async function main(argv: string[]): Promise<void> {
       if (sub === 'start') return print(await api('POST', '/lightning/start', { ...(one('repo') ? { repo: one('repo') } : {}), ...(one('panel') ? { panelSize: Number(one('panel')) } : {}) }));
       if (sub === 'show') return print(await api('GET', '/lightning'));
       if (sub === 'abort') return print(await api('POST', '/lightning/abort'));
-      if (sub === 'approve' && key && /^[A-D]$/.test(letter ?? '')) return print(await api('POST', '/lightning/approve', { key, option: letter }));
+      if (sub === 'approve' && key && /^[A-D]$/.test(letter ?? '')) {
+        // --rev is the card's `rev` from `lightning show`: a card that has changed since is refused (409) instead of getting this letter
+        const rev = one('rev');
+        if (rev !== undefined && !/^\d+$/.test(rev)) throw new Error('--rev is a whole number from 0 up: the rev of the card in `lightning show`');
+        return print(await api('POST', '/lightning/approve', { key, option: letter, ...(rev !== undefined && { rev: Number(rev) }) }));
+      }
       if ((sub === 'reject' || sub === 'defer' || sub === 'skeptics') && key) return print(await api('POST', `/lightning/${sub}`, { key }));
-      throw new Error('usage: agentim lightning start [--repo NAME] [--panel N] | show | abort | approve <key> <A-D> | reject <key> | defer <key> | skeptics <key>');
+      throw new Error('usage: agentim lightning start [--repo NAME] [--panel N] | show | abort | approve <key> <A-D> [--rev N] | reject <key> | defer <key> | skeptics <key>');
     }
     case 'pause':
       return print(await api('POST', '/pause'));

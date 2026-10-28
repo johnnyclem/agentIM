@@ -81,7 +81,15 @@ export const idIn = (text: string): string => /(?:UV|TB)-\d{4}/.exec(text)?.[0] 
 const ok = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
 const no = (): RunResult => ({ code: 128, stdout: '', stderr: 'fatal: not found' });
 
-export function world(opts: { settings?: Partial<Settings>; /** sleeps that never wake */ park?: boolean } = {}) {
+export function world(
+  opts: {
+    settings?: Partial<Settings>;
+    /** sleeps that never wake */
+    park?: boolean;
+    /** Wraps the git the hub is given (delay it, count it, make it fail); `runs` still lists every call the machine itself answered. */
+    wrapRun?: (inner: Runner) => Runner;
+  } = {}
+) {
   let now = NOW;
   let sleeps = 0;
   let roster: Agent[] = [];
@@ -101,8 +109,12 @@ export function world(opts: { settings?: Partial<Settings>; /** sleeps that neve
   /** Transcript paths whose read fails. */
   const unreadable = new Set<string>();
 
+  /** What the roster read does next: wait on `rosterGate`, or fail with `rosterError`. */
+  let rosterGate: Promise<void> | null = null;
+  let rosterError: string | null = null;
+
   const rootOf = (dir: string): string | null => (repos.has(dir) ? dir : (linked.get(dir) ?? null));
-  const run: Runner = async (cmd, args) => {
+  const answer: Runner = async (cmd, args) => {
     runs.push([cmd, ...args]);
     if (cmd !== 'git' || args[0] !== '-C') return ok('');
     const [, dir, sub, ...rest] = args;
@@ -123,6 +135,8 @@ export function world(opts: { settings?: Partial<Settings>; /** sleeps that neve
     if (sub === 'show') return ok(content);
     return ok(rest[0] === '-t' ? 'blob\n' : `${Buffer.byteLength(content)}\n`);
   };
+
+  const run: Runner = opts.wrapRun ? opts.wrapRun(answer) : answer;
 
   const path = (a: Agent): string => transcriptPath(a.cwd, a.sessionID, CLAUDE_DIR);
   /** A turn in the agent's transcript, stamped with the fake clock unless given a time. */
@@ -146,7 +160,11 @@ export function world(opts: { settings?: Partial<Settings>; /** sleeps that neve
     },
     run,
     alive: () => false,
-    listAgents: async () => roster,
+    listAgents: async () => {
+      if (rosterGate) await rosterGate;
+      if (rosterError !== null) throw new Error(rosterError);
+      return roster;
+    },
     sendInbox: async (a, text) => {
       if (failing.has(a.sessionID)) throw new Error(`refused by ${a.name}`);
       sent.push({ to: a.sessionID, text });
@@ -196,6 +214,19 @@ export function world(opts: { settings?: Partial<Settings>; /** sleeps that neve
     answerAsks: (...agents: Agent[]) => {
       for (const a of agents) answers.set(a.sessionID, (text) => (kindOf(text) === 'ask' ? block(idIn(text), `${a.name} on ${idIn(text)}`) : undefined));
     },
+    /** List these sessions without reading the roster: the hub has not seen them yet. */
+    list: (...agents: Agent[]): void => void (roster = agents),
+    /** Make the roster read wait until the returned function is called. */
+    holdRoster: (): (() => void) => {
+      let release = (): void => undefined;
+      rosterGate = new Promise<void>((r) => (release = r));
+      return () => {
+        rosterGate = null;
+        release();
+      };
+    },
+    /** Make the roster read fail with this message (null: succeed again). */
+    failRoster: (message: string | null): void => void (rosterError = message),
     /** List these sessions and read the roster. */
     ready: async (...agents: Agent[]): Promise<void> => {
       roster = agents;
@@ -219,7 +250,7 @@ export function shopApp(w: World, over: RepoSpec = {}): void {
     refs: [
       refLine('SHOP-123-queue', MONDAY + 10 * HOUR, 'SHOP-123: queue offline uploads'),
       refLine('SHOP-123-queue', MONDAY + 9 * HOUR, 'SHOP-123: queue offline uploads', true),
-      refLine('shop-123-backoff', MONDAY + 12 * HOUR, 'Back off retries'),
+      refLine('SHOP-123-backoff', MONDAY + 12 * HOUR, 'Back off retries'),
       refLine('qp27153-export-fix', MONDAY + 14 * HOUR, 'Fix the export'),
       refLine('main', MONDAY + 15 * HOUR, 'Merge pull request #9'),
       refLine('wiki', MONDAY + 16 * HOUR, 'Journal'),

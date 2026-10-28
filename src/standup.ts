@@ -7,6 +7,7 @@
  * injected Runner, as argv arrays, and nothing here writes or sends.
  */
 
+import { realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { type Agent, isStopped, projectName } from './agent.js';
 import type { Clock } from './clock.js';
@@ -154,21 +155,29 @@ type KeyFinder = (text: string) => string[];
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/** Prefixes that are never a ticket, whatever the case or the configuration: `UTF-8`, `SHA-256`, `CVE-2021` (of CVE-2021-44228). */
+const NOT_TICKETS = new Set(['UTF', 'SHA', 'MD', 'ISO', 'RFC', 'AES', 'RSA', 'TLS', 'SSL', 'HTTP', 'HTTPS', 'WCAG', 'X', 'V', 'IPV', 'CVE']);
+
 /**
- * Ticket keys in a text, uppercased, in order of appearance: `ABC-123` anywhere, plus the unhyphenated `abc123` of each configured prefix when no letter or digit touches it
- * (so `sha256` and `utf8` are never keys unless their prefix is configured).
+ * Ticket keys in a text, uppercased, in order of appearance: `ABC-123` when it is written in capitals or its prefix is a configured one (so `utf-8`, `sha-256` and `release-2026` are not keys),
+ * plus the unhyphenated `abc123` of each configured prefix when no letter or digit touches it (so `sha256` and `utf8` are never keys unless their prefix is configured).
+ * A prefix in `NOT_TICKETS` never makes a key.
  */
 function ticketKeyFinder(prefixes: string[] = []): KeyFinder {
   const forms = prefixes
     .map((p) => (typeof p === 'string' ? p.trim().replace(/-+$/, '') : ''))
     .filter((p) => p !== '')
     .map((p) => ({ upper: p.toUpperCase(), re: new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(p)}(\\d+)(?![A-Za-z0-9])`, 'gi') }));
+  const configured = new Set(forms.map((f) => f.upper));
   return (text) => {
-    const found: Array<{ at: number; key: string }> = [];
-    for (const m of text.matchAll(/\b[A-Z][A-Z0-9]+-\d+\b/gi)) found.push({ at: m.index ?? 0, key: m[0].toUpperCase() });
-    for (const f of forms) for (const m of text.matchAll(f.re)) found.push({ at: m.index ?? 0, key: `${f.upper}-${m[1]}` });
+    const found: Array<{ at: number; prefix: string; n: string }> = [];
+    for (const m of text.matchAll(/\b([A-Z][A-Z0-9]+)-(\d+)\b/gi)) {
+      const prefix = m[1].toUpperCase();
+      if (m[0] === m[0].toUpperCase() || configured.has(prefix)) found.push({ at: m.index ?? 0, prefix, n: m[2] });
+    }
+    for (const f of forms) for (const m of text.matchAll(f.re)) found.push({ at: m.index ?? 0, prefix: f.upper, n: m[1] });
     found.sort((a, b) => a.at - b.at);
-    return [...new Set(found.map((f) => f.key))];
+    return [...new Set(found.filter((f) => !NOT_TICKETS.has(f.prefix)).map((f) => `${f.prefix}-${f.n}`))];
   };
 }
 
@@ -256,8 +265,8 @@ async function readBranches(run: Runner, repos: RepoRef[], w: TimeWindow, opts: 
     repos.map(async (repo): Promise<Branch[] | null> => {
       if (!usable(repo.path)) return null;
       try {
-        const r = await run('git', ['-C', repo.path, 'for-each-ref', '--sort=-committerdate', REFS_FORMAT, 'refs/heads', 'refs/remotes'], { timeoutMs: GIT_TIMEOUT_MS });
-        if (r.code !== 0 || Buffer.byteLength(r.stdout) > MAX_REFS_BYTES) return null;
+        const r = await run('git', ['-C', repo.path, 'for-each-ref', '--sort=-committerdate', REFS_FORMAT, 'refs/heads', 'refs/remotes'], { timeoutMs: GIT_TIMEOUT_MS, maxOutputBytes: MAX_REFS_BYTES });
+        if (r.code !== 0 || r.truncated || Buffer.byteLength(r.stdout) > MAX_REFS_BYTES) return null; // a cut-off listing is unreadable, not a shorter one
         return parseRefs(r.stdout, repo, w, skip, keysOf);
       } catch {
         return null; // git missing, a bad directory or a timeout
@@ -269,12 +278,23 @@ async function readBranches(run: Runner, repos: RepoRef[], w: TimeWindow, opts: 
   return { value: per.flatMap((p) => p ?? []), ...(note !== undefined && { note }) };
 }
 
-/** The open, un-hidden rows of every repo's ledger. `no ledger` only when no repo's ledger could be read. */
-async function readRows(run: Runner, repos: RepoRef[], opts: StandupOptions): Promise<Sourced<LedgerRow[]>> {
-  if (repos.length === 0) return { value: [], note: 'no repository' };
+/** What the ledgers hold: every row read, and the ones the Lightning lane offers. */
+interface LedgerRows {
+  all: LedgerRow[];
+  open: LedgerRow[];
+}
+
+/**
+ * Every row of every repo's ledger, open or closed, hidden or not (the Ledger chip counts what was read), and among them the open rows the decision store does not hide (the Lightning lane).
+ * The note is what a repo's ledger could not give (a file over 2 MiB, git timing out), else `no ledger` when no repo's ledger could be read at all.
+ */
+async function readRows(run: Runner, repos: RepoRef[], opts: StandupOptions): Promise<Sourced<LedgerRows>> {
+  if (repos.length === 0) return { value: { all: [], open: [] }, note: 'no repository' };
   const reads = await Promise.all(repos.map((repo) => readLedger(run, repo, opts.ledgerRef ?? DEFAULT_LEDGER_REF).catch(() => null)));
-  const rows = reads.flatMap((r) => r?.rows ?? []).filter((row) => row.open && !opts.hidden?.(row.key));
-  return { value: rows, ...(reads.every((r) => r === null || r.unavailable) && { note: 'no ledger' }) };
+  const notes = reads.flatMap((r, i) => (r?.note !== undefined ? [repos.length > 1 ? `${repos[i].name}: ${r.note}` : r.note] : []));
+  const note = notes.length > 0 ? notes.join('; ') : reads.every((r) => r === null || r.unavailable) ? 'no ledger' : undefined;
+  const all = reads.flatMap((r) => r?.rows ?? []);
+  return { value: { all, open: all.filter((row) => row.open && !opts.hidden?.(row.key)) }, ...(note !== undefined && { note }) };
 }
 
 /** A counted session with what the join needs: its repo, the branch its checkout is on, and the ticket keys in its name. */
@@ -321,7 +341,7 @@ async function repoByCommonDir(run: Runner, repos: RepoRef[], cwd: string): Prom
     if (out.trim() === '') return null;
     const common = resolve(cwd, out);
     if (basename(common) !== '.git') return null;
-    const root = dirname(common);
+    const root = await realpath(dirname(common)).catch(() => dirname(common)); // discoverRepos names a repo by its real path
     return repos.find((repo) => usable(repo.path) && resolve(repo.path) === root) ?? null;
   } catch {
     return null;
@@ -383,22 +403,42 @@ interface Group {
   keys: Set<string>;
 }
 
-/** Branches of one repo that share any ticket key are one group; a branch with no key is its own. */
+/**
+ * Branches of one repo that share any ticket key are one group; a branch with no key is its own.
+ * Union-find over the branches, joined through a map from `<repo>/<key>` to the first branch that held it: near-linear however many branches there are.
+ * Groups come in the order of their first branch, and so do the branches inside a group.
+ */
 function groupBranches(branches: Branch[]): Group[] {
-  const groups: Group[] = [];
-  for (const b of branches) {
-    const hit = groups.filter((g) => g.repo.path === b.repo.path && b.keys.some((k) => g.keys.has(k)));
-    const into = hit[0] ?? { repo: b.repo, branches: [], keys: new Set<string>() };
-    if (hit.length === 0) groups.push(into);
-    for (const other of hit.slice(1)) {
-      into.branches.push(...other.branches);
-      for (const k of other.keys) into.keys.add(k);
-      groups.splice(groups.indexOf(other), 1);
+  const parent = branches.map((_, i) => i);
+  const find = (i: number): number => {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]]; // path halving
+      i = parent[i];
     }
-    into.branches.push(b);
-    for (const k of b.keys) into.keys.add(k);
-  }
-  return groups;
+    return i;
+  };
+  const holder = new Map<string, number>();
+  branches.forEach((b, i) => {
+    for (const k of b.keys) {
+      const id = `${b.repo.path}\0${k}`;
+      const j = holder.get(id);
+      if (j === undefined) {
+        holder.set(id, i);
+      } else {
+        const [a, c] = [find(i), find(j)];
+        parent[Math.max(a, c)] = Math.min(a, c); // the lower index stays the root
+      }
+    }
+  });
+  const groups = new Map<number, Group>();
+  branches.forEach((b, i) => {
+    const root = find(i);
+    const g = groups.get(root) ?? { repo: b.repo, branches: [], keys: new Set<string>() };
+    groups.set(root, g);
+    g.branches.push(b);
+    for (const k of b.keys) g.keys.add(k);
+  });
+  return [...groups.values()];
 }
 
 /** Red and amber lead, then the newest activity first. The sort is stable. */
@@ -486,12 +526,12 @@ export async function buildStandup(deps: StandupDeps, opts: StandupOptions = {})
   const keysOf = ticketKeyFinder(opts.ticketPrefixes);
   const [git, ledger, sessions] = await Promise.all([
     guarded<Branch[]>([], 'git unavailable', () => readBranches(deps.run, repos, w, opts, keysOf)),
-    guarded<LedgerRow[]>([], 'ledger unavailable', () => readRows(deps.run, repos, opts)),
+    guarded<LedgerRows>({ all: [], open: [] }, 'ledger unavailable', () => readRows(deps.run, repos, opts)),
     guarded<Live[]>([], 'sessions unavailable', () => readSessions(deps, repos, w, keysOf)),
   ]);
   const triage = triageItems(git.value, sessions.value);
   const agents = agentItems(sessions.value);
-  const lightning = orderLightningRows(ledger.value, w).map(lightningItem);
+  const lightning = orderLightningRows(ledger.value.open, w).map(lightningItem);
   return {
     at,
     covering: w.covering,
@@ -499,7 +539,7 @@ export async function buildStandup(deps: StandupDeps, opts: StandupOptions = {})
     run: w.run,
     windowStart: w.start,
     windowEnd: w.end,
-    sources: [chip('git', 'Local git', git), chip('ledger', 'Ledger', ledger), chip('sessions', 'Sessions', sessions)],
+    sources: [chip('git', 'Local git', git), chip('ledger', 'Ledger', { ...ledger, value: ledger.value.all }), chip('sessions', 'Sessions', sessions)],
     lanes: { triage: triage.length, agents: agents.length, lightning: lightning.length },
     board: [...triage, ...agents, ...lightning],
   };

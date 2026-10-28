@@ -37,7 +37,7 @@ async function api(method, path, body) {
   } catch {
     /* an empty or non-JSON body */
   }
-  if (!res.ok) throw new Error((json && json.error) || `${res.status} from ${path}`);
+  if (!res.ok) throw Object.assign(new Error((json && json.error) || `${res.status} from ${path}`), { status: res.status });
   return json;
 }
 
@@ -71,9 +71,12 @@ const S = {
   offline: false,
   // The standup's own UI state. It is not in the snapshot, so a change here calls redraw() to repaint.
   ui: {
-    lane: null, // the open lane; null until chosen (then: lightning while a round runs, else triage)
+    lane: null, // the open lane; null until chosen (then: lightning once a round has started, else triage)
     picked: null, // the picked board item's id
-    picks: new Map(), // lightning item key -> { letter, stamp }: the option picked on its card
+    picks: new Map(), // lightning item key -> { letter, stamp }: the option picked on its card, as that card (rev, verb, title) read
+    settled: new Map(), // lightning row key -> { phase, decision }: rows seen decided or deferred since the board was built
+    boardAt: null, // the `at` of the standup the board belongs to
+    onRow: null, // the board row the last repaint highlighted, so a change of current card scrolls it into view once
     votesOpen: new Set(), // lightning item keys whose Votes row is expanded
     busy: new Set(), // keys of actions in flight, so their buttons can be disabled
   },
@@ -154,6 +157,7 @@ async function fetchRight(sel) {
     }
     if (sel.kind === 'standup') {
       const [standup, lightning] = await Promise.all([api('GET', '/standup'), api('GET', '/lightning')]);
+      learnRound(standup, lightning);
       return { kind: 'standup', key: 'standup', data: { standup, lightning } };
     }
   } catch {
@@ -207,6 +211,15 @@ function showNewToasts(list) {
 
 // ---- rendering: orchestration (keeps focus, selection and scroll across re-renders) ------------------------
 
+/** Was `el` focused by the keyboard (:focus-visible), rather than by a click? */
+function keyboardFocused(el) {
+  try {
+    return el.matches(':focus-visible');
+  } catch {
+    return false; // a browser without :focus-visible
+  }
+}
+
 function render() {
   if (!S.snap) return;
   const sig = JSON.stringify([S.snap, S.right, S.offline], (k, v) => (k === 'at' || k === 'toasts' ? undefined : v));
@@ -216,6 +229,8 @@ function render() {
   const active = document.activeElement;
   const focusKey = active && active.dataset ? active.dataset.draft : undefined;
   const caret = focusKey !== undefined ? [active.selectionStart, active.selectionEnd] : null;
+  // A control reached with the keyboard keeps focus across the rebuild (a card's own controls are named by the card, so focus never lands on the next one). A mouse click does not keep it: focus on the body is what lets A-D and Enter work after one.
+  const focusId = active && active.dataset && active.dataset.focus !== undefined && keyboardFocused(active) ? active.dataset.focus : undefined;
   for (const el of document.querySelectorAll('[data-scroll]')) {
     S.scroll.set(el.dataset.scroll, { top: el.scrollTop, atBottom: el.scrollHeight - el.scrollTop - el.clientHeight < 48 });
   }
@@ -238,6 +253,15 @@ function render() {
     const top = el.dataset.top !== undefined;
     el.scrollTop = prev && (top || !prev.atBottom) ? prev.top : top ? 0 : el.scrollHeight;
   }
+  // The board keeps the person's own scrolling; only a change of the highlighted row brings it into view.
+  const row = standup ? document.querySelector('.board-row.on') : null;
+  const rowKey = row ? row.dataset.board : null;
+  if (row && rowKey !== S.ui.onRow) row.scrollIntoView({ block: 'nearest' });
+  S.ui.onRow = rowKey;
+  if (focusId !== undefined) {
+    const el = document.querySelector(`[data-focus="${CSS.escape(focusId)}"]`);
+    if (el && !el.disabled) el.focus({ preventScroll: true });
+  }
   if (focusKey !== undefined) {
     const el = document.querySelector(`[data-draft="${CSS.escape(focusKey)}"]`);
     if (el) {
@@ -255,7 +279,7 @@ function renderHeader() {
   const msgable = agents.filter(isMessageable).length;
   const running = agents.filter((a) => !isStopped(a)).length;
   const resumeN = snap.resumeSet ? snap.resumeSet.entries.length : 0;
-  const btn = (label, onclick, disabled, title) => h('button', { class: 'btn', text: label, onclick, disabled, title });
+  const btn = (label, onclick, disabled, title) => h('button', { class: 'btn', text: label, onclick, disabled, title, 'data-focus': `header:${label}` });
   return [
     h('span', { class: 'title', text: 'cIM' }),
     snap.roster.liveCount > 0 ? h('span', { class: 'live', text: `${snap.roster.liveCount} LIVE` }) : null,
@@ -792,7 +816,7 @@ const localDay = (ms) => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
-const laneOf = (d) => S.ui.lane || (d.lightning.active ? 'lightning' : 'triage');
+const laneOf = (d) => S.ui.lane || (roundStarted(d.lightning) ? 'lightning' : 'triage'); // a stopped round stays on screen
 const roundStarted = (round) => round.active || round.items.length > 0;
 
 /**
@@ -805,6 +829,19 @@ function lightningFocus(d) {
   if (picked && !round.items.some((i) => i.key === picked.rowKey)) return { kind: 'row', board: picked };
   if (roundStarted(round)) return { kind: 'card', item: round.items.find((i) => i.key === round.current) || null };
   return { kind: 'none' };
+}
+
+/** What the page keeps from the round it just read: rows settled (the board is not rebuilt, and a new round leaves them out), and the picks that still match their card. */
+function learnRound(standup, round) {
+  if (S.ui.boardAt !== standup.at) {
+    S.ui.boardAt = standup.at; // a rebuilt board lists only what is open
+    S.ui.settled.clear();
+  }
+  for (const i of round.items) if (isSettled(i.phase)) S.ui.settled.set(i.key, { phase: i.phase, decision: i.decision });
+  for (const key of [...S.ui.picks.keys()]) {
+    const item = round.items.find((i) => i.key === key);
+    if (!item || pickedLetter(item) === null) S.ui.picks.delete(key);
+  }
 }
 
 function setLane(lane) {
@@ -824,6 +861,7 @@ const startLightning = (d, keys) =>
   guarded('start', async () => {
     S.ui.lane = 'lightning';
     S.ui.picked = null;
+    S.ui.picks.clear(); // a new round asks again: nothing picked on the old cards carries over
     await api('POST', '/lightning/start', { keys: keys || d.standup.board.filter((i) => i.lane === 'lightning').map((i) => i.rowKey) });
   });
 
@@ -831,7 +869,9 @@ const startLightning = (d, keys) =>
 
 function renderStandupBar({ standup: s, lightning: round }) {
   const covering = s.through === s.covering ? s.covering : `${s.covering} - ${s.through}`;
-  const source = (c) => h('span', { class: 'pill green src', title: c.note }, `${c.label} ${c.count}`, c.note ? h('span', { class: 'mark', text: '!', role: 'img', 'aria-label': `Note: ${c.note}` }) : null);
+  // A source with a note failed or came up short: amber, and the note is on the chip, not only in its tooltip.
+  const source = (c) =>
+    h('span', { class: `pill ${c.note ? 'amber' : 'green'} src`, title: c.note }, `${c.label} ${c.count}`, c.note ? [h('span', { class: 'note', text: c.note }), h('span', { class: 'mark', text: '!', 'aria-hidden': 'true' })] : null);
   return [
     h(
       'div',
@@ -842,8 +882,8 @@ function renderStandupBar({ standup: s, lightning: round }) {
     h(
       'div',
       { class: 'sb-actions' },
-      round.active ? h('button', { class: 'btn small', text: 'Abort', title: 'Stop the Lightning round. Decisions already made are kept', onclick: () => act(() => api('POST', '/lightning/abort')) }) : null,
-      h('button', { class: 'btn small', text: 'Back to agents', onclick: () => act(() => api('POST', '/selection/clear')) })
+      round.active ? h('button', { class: 'btn small', text: 'Abort', title: 'Stop the Lightning round. Decisions already made are kept', 'data-focus': 'abort', onclick: () => act(() => api('POST', '/lightning/abort')) }) : null,
+      h('button', { class: 'btn small', text: 'Back to agents', 'data-focus': 'back', onclick: () => act(() => api('POST', '/selection/clear')) })
     ),
   ];
 }
@@ -852,7 +892,6 @@ function renderStandupNav(d) {
   const { standup: s, lightning: round } = d;
   const lane = laneOf(d);
   const items = s.board.filter((i) => i.lane === lane);
-  const phases = new Map(round.items.map((i) => [i.key, i.phase]));
   let shown = S.ui.picked;
   if (lane === 'lightning') {
     const focus = lightningFocus(d);
@@ -863,7 +902,7 @@ function renderStandupNav(d) {
     'div',
     { class: 'lanes', role: 'radiogroup', 'aria-label': 'Lane' },
     LANES.map(([id, label]) =>
-      h('button', { class: 'lane' + (id === lane ? ' on' : ''), role: 'radio', 'aria-checked': id === lane ? 'true' : 'false', onclick: () => setLane(id) }, h('span', { class: 'radio' }), h('span', { class: 'nm', text: label }), h('span', { class: 'count', text: String(s.lanes[id]) }))
+      h('button', { class: 'lane' + (id === lane ? ' on' : ''), role: 'radio', 'aria-checked': id === lane ? 'true' : 'false', 'data-focus': `lane:${id}`, onclick: () => setLane(id) }, h('span', { class: 'radio' }), h('span', { class: 'nm', text: label }), h('span', { class: 'count', text: String(s.lanes[id]) }))
     )
   );
   const start =
@@ -871,14 +910,14 @@ function renderStandupNav(d) {
       ? h(
           'div',
           { class: 'lstart' },
-          h('button', { class: 'btn primary', text: 'Start Lightning', disabled: items.length === 0 || S.ui.busy.has('start'), title: 'Settle this lane one card at a time. Asks an agent in each row’s repo to present it. A round that is running is replaced', onclick: () => startLightning(d) }),
+          h('button', { class: 'btn primary', text: 'Start Lightning', 'data-focus': 'start', disabled: items.length === 0 || S.ui.busy.has('start'), title: 'Settle this lane one card at a time. Asks an agent in each row’s repo to present it. A round that is running is replaced', onclick: () => startLightning(d) }),
           roundStarted(round) ? h('span', { class: 'muted small', text: `${c.remaining} of ${c.total} left${c.decided ? `, ${c.decided} decided` : ''}${c.deferred ? `, ${c.deferred} deferred` : ''}${round.active ? '' : ', stopped'}` }) : null
         )
       : null;
   const row = (item) =>
     h(
       'button',
-      { class: 'board-row' + (item.id === shown ? ' on' : '') + (isSettled(phases.get(item.rowKey)) ? ' done' : ''), 'data-board': item.id, 'aria-pressed': item.id === shown ? 'true' : 'false', title: `${item.title}${item.repo ? ` (${item.repo})` : ''}`, onclick: () => pickBoard(item, round) },
+      { class: 'board-row' + (item.id === shown ? ' on' : '') + (S.ui.settled.has(item.rowKey) ? ' done' : ''), 'data-board': item.id, 'data-focus': `board:${item.id}`, 'aria-pressed': item.id === shown ? 'true' : 'false', title: `${item.title}${item.repo ? ` (${item.repo})` : ''}`, onclick: () => pickBoard(item, round) },
       h('span', { class: 'tdot ' + boardTint(item.tint), 'aria-hidden': 'true' }),
       h('span', { class: 't' }, item.title, item.repo && lane !== 'lightning' ? h('span', { class: 'repo', text: ` (${item.repo})` }) : null)
     );
@@ -930,19 +969,25 @@ function detailView(item, d) {
     agents: [['Repo', item.repo], ['Last scope', item.detail], ['Ticket keys', item.refs.length ? item.refs.join(', ') : null], ['Last activity', item.at ? ago(item.at) : null], ['Directory', agent && h('span', { class: 'mono', text: agent.cwd })], ['Session', sessionID && h('span', { class: 'mono', text: sessionID.slice(0, 8), title: sessionID })]],
     lightning: [['Repo', item.repo], ['Doubt', item.detail], ['Opened', item.at ? localDay(item.at) : null], ['Key', h('span', { class: 'mono', text: item.id })]],
   }[item.lane];
+  // Starting a round replaces the one that is running, and a row that was settled is no longer open: neither may be done from here.
+  const settled = item.lane === 'lightning' ? S.ui.settled.get(item.rowKey) : null;
   const actions =
     item.lane === 'agents'
       ? h('button', { class: 'btn primary', text: 'Open thread', disabled: !agent, title: agent ? 'Back to the normal view with this session selected' : 'This session is not in the roster', onclick: () => openThread(sessionID) })
-      : item.lane === 'lightning'
-        ? h('button', { class: 'btn', text: 'Present this one', disabled: S.ui.busy.has('start'), title: 'Start a round with just this row. A round that is running is replaced', onclick: () => startLightning(d, [item.rowKey]) })
-        : null;
+      : item.lane !== 'lightning'
+        ? null
+        : settled
+          ? h('div', { class: 'lhint strong', text: settled.phase === 'decided' ? `Decided${settled.decision ? `: option ${settled.decision.option} (${verbOf(settled.decision.verb)})` : ''}` : 'Deferred until tomorrow.' })
+          : round.active
+            ? h('div', { class: 'lhint', text: 'Not in the running round.' })
+            : h('button', { class: 'btn', text: 'Present this one', 'data-focus': 'present', disabled: S.ui.busy.has('start'), title: 'Start a round with just this row', onclick: () => startLightning(d, [item.rowKey]) });
   return h(
     'div',
     { class: 'cardview', 'data-scroll': `item:${item.id}`, 'data-top': '' },
     h(
       'div',
       { class: 'lcard' },
-      h('div', { class: 'tags' }, h('span', { class: 'badge ' + boardTint(item.tint), text: sentence(item.state) })),
+      h('div', { class: 'tags' }, h('span', { class: 'badge ' + (settled ? 'grey' : boardTint(item.tint)), text: settled ? settled.phase : sentence(item.state) })),
       h('div', { class: 'ltitle', text: item.title }),
       fieldList(rows),
       actions
@@ -951,17 +996,18 @@ function detailView(item, d) {
   );
 }
 
-const pickStamp = (p) => `${p.source}:${p.presentedBy}`;
+/** What a pick was a pick of: this card (its rev, which the engine bumps whenever it presents or rejects the row) and what the letter meant on it. */
+const pickStamp = (item, o) => `${item.rev}|${o.verb}|${o.title}`;
 
-/** The letter picked on this card, if it is still one of the options of the presentation that is on screen. */
+/** The letter picked on this card, if the card and the option are still the ones that were picked. */
 function pickedLetter(item) {
   const rec = S.ui.picks.get(item.key);
-  const p = item.presentation;
-  return rec && p && rec.stamp === pickStamp(p) && p.options.some((o) => o.letter === rec.letter) ? rec.letter : null;
+  const o = rec && item.presentation && item.presentation.options.find((x) => x.letter === rec.letter);
+  return o && rec.stamp === pickStamp(item, o) ? o.letter : null;
 }
 
 function choose(item, letter) {
-  S.ui.picks.set(item.key, { letter, stamp: pickStamp(item.presentation) });
+  S.ui.picks.set(item.key, { letter, stamp: pickStamp(item, item.presentation.options.find((o) => o.letter === letter)) });
   redraw();
 }
 
@@ -992,7 +1038,8 @@ function evidenceRow(e) {
     h('span', { class: 'n muted', text: String(e.n) }),
     h('span', { class: 'pill ' + (grounded ? 'green' : 'red'), text: grounded ? `grounded${g.sha ? ` @${g.sha}` : ''}` : 'UNGROUNDED', title: grounded ? null : g.reason }),
     h('span', { class: 'cite mono', text: e.cite ? citeText(e.cite) : e.raw }),
-    e.cite && e.cite.quote ? h('span', { class: 'quote muted', text: `“${e.cite.quote}”` }) : null
+    e.cite && e.cite.quote ? h('span', { class: 'quote muted', text: `“${e.cite.quote}”` }) : null,
+    !grounded && g.reason ? h('span', { class: 'reason muted', text: g.reason }) : null
   );
 }
 
@@ -1002,7 +1049,7 @@ function optionRow(item, o, picked, enabled) {
   return h(
     'li',
     { class: 'opt' + (chosen ? ' on' : '') + (enabled ? ' live' : ''), 'data-option': o.letter, onclick: enabled ? () => choose(item, o.letter) : null },
-    h('button', { class: 'letter', text: o.letter, disabled: !enabled, 'aria-pressed': picked === o.letter ? 'true' : 'false', 'aria-label': `Option ${o.letter}: ${verbOf(o.verb)}, ${o.title}` }),
+    h('button', { class: 'letter', text: o.letter, 'data-focus': `letter:${item.key}:${o.letter}`, disabled: !enabled, 'aria-pressed': picked === o.letter ? 'true' : 'false', 'aria-label': `Option ${o.letter}: ${verbOf(o.verb)}, ${o.title}` }),
     h(
       'div',
       { class: 'obody' },
@@ -1012,6 +1059,7 @@ function optionRow(item, o, picked, enabled) {
         { class: 'owhy' },
         h('span', { class: 'pill ' + (grounded ? 'green' : 'red'), text: grounded ? 'grounded' : 'UNGROUNDED', title: grounded ? `Cites ${o.cites.join(', ')}` : o.cites.length ? 'None of the cites this option references is grounded' : 'This option cites no evidence of its own' }),
         ' ',
+        grounded ? null : [h('span', { class: 'reason muted', text: o.cites.length ? 'cites no grounded evidence.' : 'cites nothing.' }), ' '],
         o.why,
         o.cites.length ? h('span', { class: 'muted', text: ` (cites ${o.cites.join(', ')})` }) : null
       )
@@ -1024,6 +1072,8 @@ function votesRow(round, item, open) {
   const v = item.votes;
   const t = v.tally;
   const busy = S.ui.busy.has(`skeptics:${item.key}`);
+  const asked = v.asked && t.asked > 0; // a panel of nobody is not a vote with no concerns
+  const nobody = !asked && round.log.includes(`No other agent can be messaged to vote on ${item.key}.`);
   const entry = (e) =>
     h(
       'li',
@@ -1039,10 +1089,15 @@ function votesRow(round, item, open) {
     h(
       'details',
       { open: S.ui.votesOpen.has(item.key), ontoggle: (e) => (e.target.open ? S.ui.votesOpen.add(item.key) : S.ui.votesOpen.delete(item.key)) },
-      h('summary', { text: v.asked ? `Votes: ${t.concur} concur, ${t.concern} concern, ${t.refuted} refuted, ${t.silent} silent` : 'Votes: not asked' }),
-      v.asked ? h('ul', { class: 'vlist' }, v.entries.map(entry)) : h('div', { class: 'muted small', text: `Nobody has been asked. Ask skeptics sends this card to up to ${round.panelSize} other agents and asks them to vote.` })
+      h('summary', {
+        text: asked ? `Votes: ${t.concur} concur, ${t.concern} concern, ${t.refuted} refuted, ${t.silent} silent` : 'Votes: not asked',
+        // A click (detail > 0; Enter and Space give 0) leaves focus on the summary, where Enter would only toggle it again: hand focus back to the page.
+        onclick: (e) => e.detail > 0 && e.currentTarget.blur(),
+      }),
+      asked ? h('ul', { class: 'vlist' }, v.entries.map(entry)) : h('div', { class: 'muted small', text: round.active ? `Nobody has been asked. Ask skeptics sends this card to up to ${round.panelSize} other agents and asks them to vote.` : 'Nobody was asked, and the round is stopped.' })
     ),
-    !v.asked && open ? h('button', { class: 'btn small', text: 'Ask skeptics', disabled: busy, title: `Send this card to up to ${round.panelSize} other agents and ask them to vote`, onclick: () => guarded(`skeptics:${item.key}`, () => api('POST', '/lightning/skeptics', { key: item.key })) }) : null
+    nobody ? h('span', { class: 'muted small', text: 'Nobody could be asked.' }) : null,
+    !asked && open && round.active ? h('button', { class: 'btn small', text: 'Ask skeptics', 'data-focus': `skeptics:${item.key}`, disabled: busy, title: `Send this card to up to ${round.panelSize} other agents and ask them to vote`, onclick: () => guarded(`skeptics:${item.key}`, () => api('POST', '/lightning/skeptics', { key: item.key })) }) : null
   );
 }
 
@@ -1062,7 +1117,15 @@ function approve(item, letter) {
   const option = p.options.find((o) => o.letter === letter);
   const before = S.right.data.lightning.log;
   return guarded(item.key, async () => {
-    const r = await api('POST', '/lightning/approve', { key: item.key, option: letter });
+    let r;
+    try {
+      r = await api('POST', '/lightning/approve', { key: item.key, option: letter, rev: item.rev });
+    } catch (err) {
+      if (err.status !== 409) throw err;
+      S.ui.picks.delete(item.key);
+      toast('The card changed; look again.', 'err'); // act() reloads the round next
+      return;
+    }
     if (!r.decided) {
       const last = r.view.log[r.view.log.length - 1];
       toast(last && last !== before[before.length - 1] ? last : 'The decision was not recorded.', 'err');
@@ -1077,9 +1140,9 @@ function lightningCard(round, item) {
   const picked = pickedLetter(item);
   const post = (path) => () => guarded(item.key, () => api('POST', path, { key: item.key }));
   const head = [h('div', { class: 'tags' }, p ? tagPills(p) : null), h('div', { class: 'ltitle', text: item.title, title: item.title }), h('div', { class: 'lsummary', text: item.summary, title: item.summary })];
-  const deferBtn = h('button', { class: 'btn', text: 'Defer', disabled: busy, title: 'Hide this row until tomorrow', onclick: post('/lightning/defer') });
+  const deferBtn = h('button', { class: 'btn', text: 'Defer', 'data-focus': `defer:${item.key}`, disabled: busy, title: 'Hide this row until tomorrow', onclick: post('/lightning/defer') });
   const next = nextLiveKey(round, item);
-  const nextBtn = next ? h('button', { class: 'btn', text: 'Next', title: 'Go to the next card still to settle', onclick: () => act(() => api('POST', '/lightning/select', { key: next })) }) : null;
+  const nextBtn = next ? h('button', { class: 'btn', text: 'Next', 'data-focus': `next:${item.key}`, title: 'Go to the next card still to settle', onclick: () => act(() => api('POST', '/lightning/select', { key: next })) }) : null;
 
   if (!p) {
     const live = round.active && !isSettled(item.phase);
@@ -1095,16 +1158,18 @@ function lightningCard(round, item) {
   let foot;
   if (item.phase === 'decided') foot = [h('div', { class: 'lhint strong', text: `Decided: option ${item.decision.option} (${verbOf(item.decision.verb)})` }), h('div', { class: 'lactions' }, nextBtn)];
   else if (item.phase === 'deferred') foot = [h('div', { class: 'lhint strong', text: 'Deferred until tomorrow.' }), h('div', { class: 'lactions' }, nextBtn)];
-  else if (!open) foot = [h('div', { class: 'lactions' }, deferBtn)];
+  else if (!open) foot = [h('div', { class: 'lactions' }, round.active ? deferBtn : null)];
   else
     foot = [
+      // A stopped round presents nothing again and reads no votes, so Reject, Defer and Ask skeptics are not offered; the card in hand can still be approved.
+      round.active ? null : h('div', { class: 'lhint strong', text: 'This round was stopped, so Reject, Defer and Ask skeptics are off. Approve still works.' }),
       h('div', { class: 'lhint', text: chosen ? relay(chosen) : `Pick ${orList(p.options.map((o) => o.letter))} to approve.` }),
       h(
         'div',
         { class: 'lactions' },
-        h('button', { class: 'btn primary', text: 'Approve', disabled: !picked || busy, title: picked ? 'Relay the picked option to the agent' : 'Pick an option first', onclick: () => approve(item, picked) }),
-        h('button', { class: 'btn', text: 'Reject', disabled: busy, title: 'None of these: ask again later with a different presenter', onclick: post('/lightning/reject') }),
-        deferBtn
+        h('button', { class: 'btn primary', text: 'Approve', 'data-focus': `approve:${item.key}`, disabled: !picked || busy, title: picked ? 'Relay the picked option to the agent' : 'Pick an option first', onclick: () => approve(item, picked) }),
+        round.active ? h('button', { class: 'btn', text: 'Reject', 'data-focus': `reject:${item.key}`, disabled: busy, title: 'None of these: ask again later with a different presenter', onclick: post('/lightning/reject') }) : null,
+        round.active ? deferBtn : null
       ),
     ];
 
@@ -1264,10 +1329,12 @@ function openCard() {
 }
 
 // A-D pick an option and Enter approves it. A field, a button or a modifier key means the person is doing something else.
+// The Votes summary is not one of those: A-D must not die while it has focus. Enter on a summary the person tabbed to opens or closes it, as it does everywhere else.
 document.addEventListener('keydown', (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.repeat || e.defaultPrevented) return;
   const focus = document.activeElement;
-  if (focus && ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SUMMARY'].includes(focus.tagName)) return;
+  if (focus && ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(focus.tagName)) return;
+  if (focus && focus.tagName === 'SUMMARY' && e.key === 'Enter') return;
   if (document.querySelector('dialog[open]')) return;
   const item = openCard();
   if (!item) return;

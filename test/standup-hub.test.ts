@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { KEYS } from '../src/store.js';
+import type { Runner } from '../src/runner.js';
 import { BILLING, DAY, HOUR, MONDAY, NOW, SHOP, idIn, jsonl, kindOf, refLine, shopApp, voteBlock, world, type World } from './standup-world.js';
 
 const UV_36 = 'uv:shop-app:UV-0036';
@@ -23,6 +24,8 @@ const ticks = async (n = 5) => {
   for (let i = 0; i < n; i++) await new Promise<void>((r) => setImmediate(r));
 };
 
+const emfile = () => Object.assign(new Error('spawn git EMFILE'), { code: 'EMFILE' });
+
 const statusReport = (status: string, scope: string) => `\`\`\`cim-status\nscope: ${scope}\nstatus: ${status}\n\`\`\``;
 const chip = (s: { sources: Array<{ id: string }> }, id: string) => s.sources.find((c) => c.id === id);
 
@@ -44,17 +47,17 @@ describe('the standup through the hub', () => {
     const standup = await w.hub.buildStandup();
 
     expect(standup).toMatchObject({ at: NOW, covering: '2026-10-26', through: '2026-10-26', run: '2026-10-27', windowStart: MONDAY, windowEnd: new Date(2026, 9, 27).getTime() });
-    // chips are raw counts per source: 3 branches in the window (the remote copy and the local branch are one), 2 open rows, 3 sessions (the stopped one from last week is not one)
+    // chips are raw counts per source: 3 branches in the window (the remote copy and the local branch are one), 4 ledger rows read (2 of them closed), 3 sessions (the stopped one from last week is not one)
     expect(standup.sources.map((s) => [s.id, s.count, s.note])).toEqual([
       ['git', 3, undefined],
-      ['ledger', 2, undefined],
+      ['ledger', 4, undefined],
       ['sessions', 3, undefined],
     ]);
     // lanes count the board after the join: the two SHOP-123 branches are one item
     expect(standup.lanes).toEqual({ triage: 2, agents: 3, lightning: 2 });
     const triage = standup.board.filter((i) => i.lane === 'triage');
     expect(triage.map((i) => [i.id, i.title, i.detail, i.refs, i.tint, i.sessionIDs])).toEqual([
-      ['branch:shop-app:SHOP-123', 'shop-123-backoff', '+1 more', ['SHOP-123'], 'red', ['A']], // A is on SHOP-123-queue and says it waits for a human
+      ['branch:shop-app:SHOP-123', 'SHOP-123-backoff', '+1 more', ['SHOP-123'], 'red', ['A']], // A is on SHOP-123-queue and says it waits for a human
       ['branch:shop-app:QP-27153', 'qp27153-export-fix', 'Fix the export', ['QP-27153'], 'blue', undefined], // the prefix from the settings makes qp27153 a key
     ]);
     const agents = standup.board.filter((i) => i.lane === 'agents');
@@ -236,7 +239,7 @@ describe('the Lightning Round through the hub', () => {
     expect((await w.hub.openRows()).map((r) => r.id)).toEqual(['UV-0021']);
     const next = await w.hub.buildStandup();
     expect(next.lanes.lightning).toBe(1);
-    expect(chip(next, 'ledger')).toMatchObject({ count: 1 });
+    expect(chip(next, 'ledger')).toMatchObject({ count: 4 }); // the chip counts every row read, decided or not; the lane is what is left to settle
     expect(next.board.filter((i) => i.lane === 'lightning').map((i) => i.rowKey)).toEqual([UV_21]);
   });
 
@@ -428,6 +431,361 @@ describe('the Lightning Round through the hub', () => {
     await ticks(30);
     expect({ sleeps: w.sleeps(), sent: w.sent.length, now: w.now() }).toEqual(after);
     expect(w.hub.lightningView().active).toBe(false);
+  });
+});
+
+describe('the roster behind the standup', () => {
+  it('a standup asked for before the roster was read waits for that read, instead of showing an empty morning', async () => {
+    const w = make();
+    shopApp(w);
+    w.list(w.agent('A'), w.agent('B')); // listed, but the hub has not read the roster yet
+    expect(w.hub.roster.hasLoaded).toBe(false);
+    const standup = await w.hub.buildStandup();
+    expect(w.hub.roster.hasLoaded).toBe(true);
+    expect(standup.sources.map((s) => [s.id, s.count, s.note])).toEqual([
+      ['git', 3, undefined], // the repo is found through the sessions' working directories
+      ['ledger', 4, undefined],
+      ['sessions', 2, undefined],
+    ]);
+  });
+
+  it('and when the poller’s own first read is still running, it waits for that one', async () => {
+    const w = make();
+    shopApp(w);
+    w.list(w.agent('A'));
+    const release = w.holdRoster();
+    w.hub.start(60_000);
+    await ticks();
+    expect(w.hub.roster).toMatchObject({ isRefreshing: true, hasLoaded: false });
+    let built = false;
+    const pending = w.hub.buildStandup().then((s) => ((built = true), s));
+    await ticks(20);
+    expect(built).toBe(false);
+    release();
+    const standup = await pending;
+    expect(chip(standup, 'sessions')).toMatchObject({ count: 1 });
+    expect(chip(standup, 'git')).toMatchObject({ count: 3 });
+  });
+
+  it('a roster that could not be read is a note on the Sessions chip, one line, ahead of the engine’s own note', async () => {
+    const w = make();
+    shopApp(w);
+    w.failRoster('claude agents exited 1: boom\n    at somewhere\n' + 'x'.repeat(500));
+    w.list(w.agent('A'));
+    const none = await w.hub.buildStandup(); // never loaded, and the read fails
+    expect(w.hub.roster).toMatchObject({ hasLoaded: false });
+    const note = chip(none, 'sessions')!;
+    expect(note).toMatchObject({ count: 0 });
+    expect((note as { note: string }).note).toMatch(/^roster unavailable: claude agents exited 1: boom at somewhere xxx/);
+    expect((note as { note: string }).note).not.toContain('\n');
+    expect((note as { note: string }).note.length).toBeLessThanOrEqual('roster unavailable: '.length + 200);
+
+    // a read that worked once and then fails keeps the sessions it knew; the chip says they may be out of date, and keeps what it already said
+    w.failRoster(null);
+    const [a, b] = [w.agent('A'), w.agent('B')];
+    w.breakTranscript(a);
+    await w.ready(a, b);
+    expect(chip(await w.hub.buildStandup(), 'sessions')).toEqual({ id: 'sessions', label: 'Sessions', count: 2, note: 'activity unavailable for 1 of 2 sessions' });
+    w.failRoster('gone');
+    await w.hub.refresh();
+    expect(w.hub.roster).toMatchObject({ hasLoaded: true, lastError: 'gone' });
+    expect(chip(await w.hub.buildStandup(), 'sessions')).toEqual({ id: 'sessions', label: 'Sessions', count: 2, note: 'roster unavailable: gone; activity unavailable for 1 of 2 sessions' });
+    w.failRoster(null);
+    await w.hub.refresh();
+    expect(chip(await w.hub.buildStandup(), 'sessions')).toMatchObject({ note: 'activity unavailable for 1 of 2 sessions' }); // a clean read clears it
+  });
+});
+
+describe('git behind a limit', () => {
+  it('never has more than eight git processes at once, so a machine with eight file descriptors to spare refuses none, in the standup or the round', async () => {
+    let inflight = 0;
+    let peak = 0;
+    let refused = 0;
+    const w = make({
+      wrapRun: (inner) => async (cmd, args, opts) => {
+        inflight++;
+        peak = Math.max(peak, inflight);
+        try {
+          await new Promise<void>((r) => setImmediate(r)); // a process takes a moment to start
+          if (inflight > 8) {
+            refused++;
+            throw emfile();
+          }
+          return await inner(cmd, args, opts);
+        } finally {
+          inflight--;
+        }
+      },
+    });
+    const agents = Array.from({ length: 30 }, (_, i) => {
+      w.repos.set(`/work/r${i}`, {
+        refs: [refLine(`R${i}-1-work`, MONDAY + 10 * HOUR, 'Work')],
+        ledger: { 'wiki:unverified.jsonl': jsonl({ id: 'UV-0001', date: '2026-10-26', claim: `claim ${i}` }) },
+        files: { 'src/session.ts': 'x\n' },
+      });
+      return w.agent(`S${i}`, { cwd: `/work/r${i}` });
+    });
+    w.answerAsks(...agents);
+    await w.ready(...agents);
+
+    const standup = await w.hub.buildStandup();
+    expect(standup.sources.map((s) => [s.id, s.count, s.note])).toEqual([
+      ['git', 30, undefined],
+      ['ledger', 30, undefined],
+      ['sessions', 30, undefined],
+    ]);
+    const round = await w.hub.lightningStart();
+    expect(round.counts.total).toBe(30);
+    await w.settle();
+    expect(w.hub.lightningView().items.filter((i) => i.phase === 'presented').length).toBeGreaterThan(0); // the cites of the presented cards were grounded through the same limit
+    expect(w.runs.some((r) => r[3] === 'cat-file')).toBe(true);
+    expect(refused).toBe(0);
+    expect(peak).toBeLessThanOrEqual(8);
+    expect(peak).toBeGreaterThan(1); // the limit is a cap, not a queue of one
+  });
+
+  it('git failing on every call (no descriptors left, or no git) is notes in the standup and a line in the round’s log, with nothing thrown and nothing left unhandled', async () => {
+    const stray: unknown[] = [];
+    const onStray = (reason: unknown) => void stray.push(reason);
+    process.on('unhandledRejection', onStray);
+    try {
+      const w = make({
+        wrapRun: () => async () => {
+          throw emfile();
+        },
+      });
+      shopApp(w);
+      const a = w.agent('A');
+      await w.ready(a);
+      const standup = await w.hub.buildStandup();
+      expect(chip(standup, 'git')).toMatchObject({ count: 0, note: 'no repository' });
+      expect(chip(standup, 'sessions')).toMatchObject({ count: 1 });
+      const round = await w.hub.lightningStart();
+      expect(round).toMatchObject({ active: true, items: [] });
+      expect(round.log).toEqual(['No repository found: pass --repo or start an agent inside one.']);
+      expect(await w.hub.tbuvLookup(['UV-0036'], SHOP)).toEqual([{ id: 'UV-0036', kind: 'not-found' }]);
+      await ticks(20);
+      expect(stray).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onStray);
+    }
+  });
+});
+
+describe('starting a round while another start or an abort happens', () => {
+  /** A world whose git waits for `release()` while `held()` is true. */
+  function slowGit() {
+    let hold = false;
+    let release = (): void => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    const w = make({
+      settings: { repoPath: SHOP },
+      wrapRun: (inner) => async (cmd, args, opts) => {
+        if (hold) await gate;
+        return inner(cmd, args, opts);
+      },
+    });
+    shopApp(w);
+    return { w, slow: (on: boolean) => void (hold = on), release: () => release() };
+  }
+
+  it('an abort while the start is still reading leaves no round, and asks nobody', async () => {
+    const { w, slow, release } = slowGit();
+    const a = w.agent('A');
+    w.answerAsks(a);
+    await w.ready(a);
+    slow(true);
+    const start = w.hub.lightningStart({ keys: [UV_36] });
+    await ticks();
+    w.hub.lightningAbort();
+    slow(false);
+    release();
+    const view = await start;
+    expect(view).toMatchObject({ active: false, items: [] });
+    expect(w.hub.lightning).toBeNull();
+    expect(w.hub.lightningView().active).toBe(false);
+    await w.settle();
+    expect(w.sent).toEqual([]);
+    expect(w.hub.snapshot().lightning).toBeNull();
+  });
+
+  it('stopping the hub does the same: no round is started after shutdown', async () => {
+    const { w, slow, release } = slowGit();
+    const a = w.agent('A');
+    w.answerAsks(a);
+    await w.ready(a);
+    slow(true);
+    const start = w.hub.lightningStart({ keys: [UV_36] });
+    await ticks();
+    w.hub.stop();
+    slow(false);
+    release();
+    await start;
+    expect(w.hub.lightning).toBeNull();
+    expect(w.sent).toEqual([]);
+    await ticks(10);
+    expect(w.sleeps()).toBe(0); // and no poller is running
+  });
+
+  it('a start that was asked for while an earlier one was still reading leaves the LATER one running, whichever finishes first', async () => {
+    const { w, slow, release } = slowGit();
+    const a = w.agent('A');
+    w.answerAsks(a);
+    await w.ready(a);
+    slow(true);
+    const first = w.hub.lightningStart({ keys: [UV_36] });
+    await ticks();
+    slow(false); // the second one reads quickly
+    const second = await w.hub.lightningStart({ keys: [UV_21] });
+    const later = w.hub.lightning!;
+    expect(second.items.map((i) => i.key)).toEqual([UV_21]);
+    release();
+    const overtaken = await first;
+    expect(w.hub.lightning).toBe(later);
+    expect(later.view().active).toBe(true);
+    expect(overtaken.items.map((i) => i.key)).toEqual([UV_21]); // an overtaken start answers with the round that is there
+    await w.settle();
+    expect(w.sent.map((s) => [kindOf(s.text), idIn(s.text)])).toEqual([['ask', 'UV-0021']]);
+    expect(w.hub.lightningView()).toMatchObject({ active: true, current: UV_21 });
+  });
+
+  it('a start after an abort is a fresh start and works', async () => {
+    const { w } = slowGit();
+    const a = w.agent('A');
+    w.answerAsks(a);
+    await w.ready(a);
+    w.hub.lightningAbort();
+    expect(await w.hub.lightningStart({ keys: [UV_36] })).toMatchObject({ active: true, current: UV_36 });
+  });
+});
+
+describe('why a round is empty', () => {
+  /** The shop-app with an agent in it that answers, so the engine itself has nothing to log. */
+  async function shop(opts: Parameters<typeof world>[0] = {}, ...more: Array<ReturnType<World['agent']>>): Promise<World> {
+    const w = make({ settings: { repoPath: SHOP }, ...opts });
+    shopApp(w);
+    const a = w.agent('A');
+    w.answerAsks(a);
+    await w.ready(a, ...more);
+    return w;
+  }
+
+  it('no repository at all: the log says to pass --repo or start an agent inside one', async () => {
+    const w = make();
+    await w.ready(w.agent('X', { cwd: '/elsewhere' }));
+    const view = await w.hub.lightningStart();
+    expect(view.log).toEqual(['No repository found: pass --repo or start an agent inside one.']);
+    expect(w.events.filter((e) => e.type === 'lightning').length).toBeGreaterThan(0); // and the listeners were told
+  });
+
+  it('a repository whose ledger branch is not there: the log says so, and a healthy start says nothing', async () => {
+    const w = make({ settings: { repoPath: SHOP } });
+    w.repos.set(SHOP, { refs: [refLine('SHOP-9-x', MONDAY + 10 * HOUR, 'Work')] }); // no wiki branch
+    await w.ready();
+    expect((await w.hub.lightningStart()).log).toEqual(['No ledger could be read in 1 repo(s): no ledger branch.']);
+
+    const healthy = await shop();
+    const view = await healthy.hub.lightningStart();
+    await healthy.settle();
+    expect(view.items).toHaveLength(2);
+    expect(healthy.hub.lightningView().log).toEqual([]);
+  });
+
+  it('a ledger file that was too large to read: the note names the file, whether the other file gave rows or not', async () => {
+    const truncate = (when: (args: string[]) => boolean) => (inner: Runner): Runner => async (cmd, args, opts) => (when(args) ? { code: 1, stdout: '', stderr: '', truncated: true } : inner(cmd, args, opts));
+
+    const one = await shop({ wrapRun: truncate((args) => args.includes('wiki:tombstones.jsonl')) });
+    const partial = await one.hub.lightningStart();
+    expect(partial.items.map((i) => i.id)).toEqual(['UV-0021', 'UV-0036']); // the unverified rows still make the round
+    expect(partial.log).toEqual(['Part of the ledger could not be read in 1 repo(s): tombstones.jsonl is larger than 2 MiB.']);
+
+    const all = await shop({ wrapRun: truncate((args) => args.includes('show')) });
+    const none = await all.hub.lightningStart();
+    expect(none.items).toEqual([]);
+    expect(none.log).toEqual(['No ledger could be read in 1 repo(s): tombstones.jsonl is larger than 2 MiB; unverified.jsonl is larger than 2 MiB.']);
+  });
+
+  it('some repositories fail and others work: the failing ones are named and the working ones are in the round', async () => {
+    const w = make({ settings: { repoPath: SHOP } });
+    shopApp(w);
+    w.repos.set(BILLING, { refs: [] }); // repos with no ledger branch
+    w.repos.set('/work/notes', { refs: [] });
+    const a = w.agent('A');
+    w.answerAsks(a);
+    await w.ready(a, w.agent('B', { cwd: BILLING }), w.agent('N', { cwd: '/work/notes' }));
+    const view = await w.hub.lightningStart();
+    expect(view.items.map((i) => i.key)).toEqual([UV_21, UV_36]);
+    expect(view.log).toEqual(['No ledger could be read in 2 repo(s): billing: no ledger branch; notes: no ledger branch.']);
+  });
+
+  it('a repo name that matches no repository is said so, with the names that do', async () => {
+    const w = await shop();
+    const view = await w.hub.lightningStart({ repo: SHOP }); // a path, where the folder name is wanted
+    expect(view).toMatchObject({ active: true, items: [] });
+    expect(view.log).toEqual([`No repository named ${SHOP}; the repositories are shop-app.`]);
+    const right = await w.hub.lightningStart({ repo: 'shop-app' });
+    await w.settle();
+    expect(right.items).toHaveLength(2);
+    expect(w.hub.lightningView().log).toEqual([]);
+  });
+
+  it('the lines come first in the round’s log, ahead of the engine’s own', async () => {
+    const w = make({ settings: { repoPath: SHOP }, wrapRun: (inner) => async (cmd, args, opts) => (args.includes('wiki:tombstones.jsonl') ? { code: 1, stdout: '', stderr: '', truncated: true } : inner(cmd, args, opts)) });
+    shopApp(w);
+    await w.ready(); // nobody to ask: the engine logs a line of its own per card
+    await w.hub.lightningStart({ keys: [UV_36] });
+    await w.settle();
+    expect(w.hub.lightningView().log).toEqual([
+      'Part of the ledger could not be read in 1 repo(s): tombstones.jsonl is larger than 2 MiB.',
+      `No presentation for ${UV_36}: No agent in shop-app can be messaged. Showing the ledger row.`,
+    ]);
+  });
+});
+
+describe('keys and repository names in the queue', () => {
+  it('the keys are looked up in a Set built once, not scanned for every row', async () => {
+    const w = make({ settings: { repoPath: SHOP } });
+    shopApp(w);
+    await w.ready();
+    let scans = 0;
+    class Keys extends Array<string> {
+      override includes(...args: Parameters<Array<string>['includes']>): boolean {
+        scans++;
+        return super.includes(...args);
+      }
+    }
+    const view = await w.hub.lightningStart({ keys: Keys.from([UV_36, UV_21, 'uv:nowhere:UV-1']) });
+    expect(view.items.map((i) => i.key)).toEqual([UV_21, UV_36]);
+    expect(scans).toBe(0);
+  });
+
+  it('two repositories with one folder name get distinct row keys, and settling one leaves the other in the queue', async () => {
+    const w = make();
+    const ledger = (claim: string) => ({ 'wiki:unverified.jsonl': jsonl({ id: 'UV-0001', date: '2026-10-26', claim }) });
+    w.repos.set('/a/app', { refs: [], ledger: ledger('the claim in a') });
+    w.repos.set('/b/app', { refs: [], ledger: ledger('the claim in b') });
+    const [a, b] = [w.agent('A', { cwd: '/a/app' }), w.agent('B', { cwd: '/b/app' })];
+    w.answerAsks(a, b);
+    await w.ready(a, b);
+
+    expect((await w.hub.openRows()).map((r) => [r.key, r.repo, r.claim])).toEqual([
+      ['uv:a~app:UV-0001', 'a~app', 'the claim in a'],
+      ['uv:b~app:UV-0001', 'b~app', 'the claim in b'],
+    ]);
+    const standup = await w.hub.buildStandup();
+    expect(standup.board.filter((i) => i.lane === 'lightning').map((i) => i.rowKey)).toEqual(['uv:a~app:UV-0001', 'uv:b~app:UV-0001']);
+    expect(standup.lanes.lightning).toBe(2);
+    expect(standup.board.filter((i) => i.lane === 'agents').map((i) => i.repo)).toEqual(['a~app', 'b~app']);
+
+    const view = await w.hub.lightningStart();
+    expect(view.counts.total).toBe(2);
+    await w.settle();
+    expect(w.sent.filter((s) => kindOf(s.text) === 'ask').map((s) => s.to)).toEqual(['A', 'B']); // each repo's row is asked of the agent in that repo
+    w.hub.lightningDefer('uv:a~app:UV-0001');
+    expect(w.hub.decisions.hidden('uv:a~app:UV-0001')).toBe(true);
+    expect(w.hub.decisions.hidden('uv:b~app:UV-0001')).toBe(false);
+    expect((await w.hub.openRows()).map((r) => r.key)).toEqual(['uv:b~app:UV-0001']);
+    expect((await w.hub.lightningStart({ repo: 'b~app' })).items.map((i) => i.key)).toEqual(['uv:b~app:UV-0001']); // the filter takes the name the rows carry
   });
 });
 

@@ -8,7 +8,7 @@
  */
 
 import { fencedBlock } from './status-report.js';
-import { LIGHTNING_FENCE, VOTE_FENCE } from './prompts.js';
+import { LIGHTNING_FENCE, VOTE_FENCE, quoted } from './prompts.js';
 
 export type Needs = 'human' | 'agent' | 'none';
 export type Nature = 'decision' | 'fact' | 'measurement';
@@ -27,6 +27,8 @@ export interface RawOption {
 
 export interface RawPresentation {
   id: string | null;
+  /** The `repo:` line as written; null when the block has none. */
+  repo: string | null;
   needs: Needs | null;
   nature: Nature | null;
   checkable: Checkable | null;
@@ -40,6 +42,7 @@ export interface RawPresentation {
 
 export interface RawVote {
   id: string | null;
+  repo: string | null;
   vote: 'concur' | 'concern' | 'refuted';
   prefers: Letter | null;
   reason: string;
@@ -68,6 +71,10 @@ const MAX_TEXT = 1_500;
 const MAX_EVIDENCE = 20;
 const MAX_EVIDENCE_LINE = 1_000;
 const MAX_CITES = 20;
+/** A reply that opens more fences of one kind than this is not read past the last of them. */
+const MAX_FENCES = 8;
+/** The template's `needs`, `nature`, `checkable`, `vote` and `prefers` lines list the words with pipes: only there is a `|` the ask echoed back. */
+const ENUM_KEYS: ReadonlySet<string> = new Set(['needs', 'nature', 'checkable', 'vote', 'prefers']);
 
 /** `Confirm`, `Deny`, `Challenge`, `No change`: how the card spells a verb. */
 export const verbLabel = (v: Verb): string => VERB_LABEL[v];
@@ -76,6 +83,22 @@ export const verbLabel = (v: Verb): string => VERB_LABEL[v];
 export function hasFence(text: string, info: string): boolean {
   if (typeof text !== 'string') return false;
   return fencedBlock(text + '\n```', info) !== null; // a closing fence is appended so an unclosed one still counts
+}
+
+/** The closed fences with this info string, in order: their bodies, from at most MAX_FENCES opening lines. The same fence syntax as `fencedBlock` (status-report.ts), which reads only the first. */
+function* fencedBlocks(text: string, info: string): Generator<string> {
+  const open = new RegExp('```[ \\t]*' + info.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&') + '[ \\t]*\\r?\\n', 'g');
+  let from = 0;
+  for (let n = 0; n < MAX_FENCES; n++) {
+    open.lastIndex = from;
+    const m = open.exec(text);
+    if (!m) return;
+    const bodyStart = m.index + m[0].length;
+    const close = text.indexOf('```', bodyStart);
+    if (close < 0) return;
+    yield text.slice(bodyStart, close);
+    from = close + 3;
+  }
 }
 
 function clip(text: string, max: number): string {
@@ -92,7 +115,7 @@ interface Block {
   lists: Map<string, string[]>;
 }
 
-/** `key: value` scalars (keys lower-cased) and `- ` list lines under a bare `key:`; a value with `|` or a bare `<placeholder>` is the ask's template echoed back and is left out. */
+/** `key: value` scalars (keys lower-cased) and `- ` list lines under a bare `key:`; a bare `<placeholder>` is the ask's template echoed back and is left out, and so is a `|` in one of the enumerated fields (free text keeps its pipes). */
 function parseBlock(body: string): Block {
   const scalars = new Map<string, string>();
   const lists = new Map<string, string[]>();
@@ -113,17 +136,28 @@ function parseBlock(body: string): Block {
       continue;
     }
     listKey = value ? null : key;
-    if (value && !value.includes('|') && !isPlaceholder(value)) scalars.set(key, value);
+    if (value && !isPlaceholder(value) && !(ENUM_KEYS.has(key) && value.includes('|'))) scalars.set(key, value);
   }
   return { scalars, lists };
 }
 
-/** The parsed first block with this info string, or null without a closing fence or when it is too large. */
-function readBlock(text: string, info: string): Block | null {
-  if (typeof text !== 'string') return null;
-  const body = fencedBlock(text, info);
-  if (body === null || body.length > MAX_BLOCK_CHARS) return null;
-  return parseBlock(body);
+/** The parsed closed blocks with this info string, in order; one that is too large is skipped. */
+function* readBlocks(text: string, info: string): Generator<Block> {
+  if (typeof text !== 'string') return;
+  for (const body of fencedBlocks(text, info)) if (body.length <= MAX_BLOCK_CHARS) yield parseBlock(body);
+}
+
+/** The value of the last `key:` line of a fence body (empty and placeholder values do not count), or null. Linear in the body: no backtracking, whatever the text. */
+function scalarOf(body: string, key: string): string | null {
+  let found: string | null = null;
+  for (const raw of body.split(/\r?\n/)) {
+    const line = raw.trim();
+    const colon = line.indexOf(':');
+    if (colon < 0 || line.slice(0, colon).trim().toLowerCase() !== key) continue;
+    const value = line.slice(colon + 1).trim();
+    if (value && !isPlaceholder(value)) found = value;
+  }
+  return found;
 }
 
 /** One of the listed words, matched whole and case-insensitively (a trailing full stop or comma is allowed), else null. */
@@ -145,14 +179,24 @@ function verbOf(value: string): Verb | null {
   return v === 'nochange' ? 'no_change' : null;
 }
 
-/** Comma or space separated positive whole numbers, each once, in order; anything else in the field is ignored. */
+/**
+ * The evidence numbers an option cites: positive whole numbers separated by commas, semicolons or spaces, optionally in brackets or
+ * after a `#`, each once, in order, at most MAX_CITES; `1-3` is 1, 2 and 3. A field with anything else in it (a word, a full stop, a
+ * stray hyphen) is prose, not a cite list, and cites nothing: the digits inside "none (checked 2 files)" are not evidence 2.
+ */
 function citesOf(field: string): number[] {
   const out: number[] = [];
-  for (const token of field.split(/[\s,]+/)) {
-    if (!/^[0-9]+$/.test(token)) continue;
-    const n = Number(token);
-    if (Number.isSafeInteger(n) && n >= 1 && !out.includes(n)) out.push(n);
-    if (out.length >= MAX_CITES) break;
+  if (!/^[\d\s,;#[\]()-]*$/.test(field)) return out;
+  const spans = field
+    .split(/[\s,;#[\]()]+/)
+    .filter((token) => token !== '')
+    .map((token) => /^(\d+)(?:-(\d+))?$/.exec(token));
+  for (const m of spans) {
+    if (!m) return [];
+    const from = Number(m[1]);
+    const to = m[2] === undefined ? from : Number(m[2]);
+    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 1) continue;
+    for (let n = from; n <= to && out.length < MAX_CITES; n++) if (!out.includes(n)) out.push(n);
   }
   return out;
 }
@@ -186,14 +230,15 @@ function optionsOf(lines: string[]): RawOption[] {
 }
 
 const sameId = (id: string | null, expected: string): boolean => id !== null && id.toLowerCase() === expected.trim().toLowerCase();
+/** A block with no `repo:` line is about any repo (agents drop lines); one with a line must name this repo, as the template wrote it. */
+const sameRepo = (repo: string | null, expected: string): boolean => repo === null || quoted(repo, 120).toLowerCase() === quoted(expected, 120).toLowerCase();
 
-/** Parse a turn's text as a presentation: the first `cim-lightning` block only; null unless it closes, the id matches `expectId` when given, there are 2+ well-formed options and a claim or assessment. */
-export function parsePresentation(text: string, expectId?: string): RawPresentation | null {
-  const block = readBlock(text, LIGHTNING_FENCE);
-  if (!block) return null;
-  const { scalars, lists } = block;
+/** One block read as a presentation; null unless the id (and repo, when given) match, there are 2+ well-formed options and a claim or assessment. */
+function presentationOf({ scalars, lists }: Block, expectId: string | undefined, expectRepo: string | undefined): RawPresentation | null {
   const id = scalars.get('id') ?? null;
+  const repo = scalars.get('repo') ?? null;
   if (expectId !== undefined && !sameId(id, expectId)) return null;
+  if (expectRepo !== undefined && !sameRepo(repo, expectRepo)) return null;
   const claim = clip(scalars.get('claim') ?? '', MAX_TEXT);
   const assessment = clip(scalars.get('assessment') ?? '', MAX_TEXT);
   if (!claim && !assessment) return null;
@@ -201,6 +246,7 @@ export function parsePresentation(text: string, expectId?: string): RawPresentat
   if (options.length < 2) return null;
   return {
     id,
+    repo,
     needs: listed(scalars.get('needs'), NEEDS),
     nature: listed(scalars.get('nature'), NATURES),
     checkable: listed(scalars.get('checkable'), CHECKABLES),
@@ -215,16 +261,45 @@ export function parsePresentation(text: string, expectId?: string): RawPresentat
   };
 }
 
-/** Parse a turn's text as a vote. Only the first `cim-vote` block is read. Null without a recognized `vote` or when `id` does not match `expectId`. */
-export function parseVote(text: string, expectId?: string): RawVote | null {
-  const block = readBlock(text, VOTE_FENCE);
-  if (!block) return null;
-  const { scalars } = block;
-  const id = scalars.get('id') ?? null;
-  if (expectId !== undefined && !sameId(id, expectId)) return null;
-  const vote = listed(scalars.get('vote'), VOTES);
-  if (!vote) return null;
-  return { id, vote, prefers: letterOf(scalars.get('prefers')), reason: clip(scalars.get('reason') ?? '', MAX_TEXT) };
+/**
+ * Parse a turn's text as a presentation: the first `cim-lightning` block (of at most 8) that is usable and about this row. A block whose
+ * id differs from `expectId`, or whose `repo:` line differs from `expectRepo`, is another row's and is skipped; one without a repo line is not.
+ */
+export function parsePresentation(text: string, expectId?: string, expectRepo?: string): RawPresentation | null {
+  for (const block of readBlocks(text, LIGHTNING_FENCE)) {
+    const found = presentationOf(block, expectId, expectRepo);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Parse a turn's text as a vote: the first `cim-vote` block (of at most 8) with a recognized `vote` that is about this row, as for `parsePresentation`. */
+export function parseVote(text: string, expectId?: string, expectRepo?: string): RawVote | null {
+  for (const { scalars } of readBlocks(text, VOTE_FENCE)) {
+    const id = scalars.get('id') ?? null;
+    const repo = scalars.get('repo') ?? null;
+    if (expectId !== undefined && !sameId(id, expectId)) continue;
+    if (expectRepo !== undefined && !sameRepo(repo, expectRepo)) continue;
+    const vote = listed(scalars.get('vote'), VOTES);
+    if (vote) return { id, repo, vote, prefers: letterOf(scalars.get('prefers')), reason: clip(scalars.get('reason') ?? '', MAX_TEXT) };
+  }
+  return null;
+}
+
+/**
+ * True when the text has fences of this kind and every one says it is about another row: another id, or this id under another repo.
+ * A fence with no id line (or only the template's placeholder) is not provably another's. Reads unclosed fences too, and does not
+ * parse the body: only its `id:` and `repo:` lines, in time linear in the text.
+ */
+export function namesAnotherRow(text: string, info: string, expectId: string, expectRepo?: string): boolean {
+  if (typeof text !== 'string') return false;
+  let any = false;
+  for (const body of fencedBlocks(text + '\n```', info)) {
+    const id = scalarOf(body, 'id');
+    if (id === null || (sameId(id, expectId) && (expectRepo === undefined || sameRepo(scalarOf(body, 'repo'), expectRepo)))) return false;
+    any = true;
+  }
+  return any;
 }
 
 /** Count the votes; a null entry was asked and did not answer, so it is silent. */

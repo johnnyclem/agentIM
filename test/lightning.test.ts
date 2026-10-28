@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { DecisionStore, LightningRound, type LightningDeps, type LightningView } from '../src/lightning.js';
+import { DecisionStore, LightningRound, StaleCardError, type LightningDeps, type LightningView } from '../src/lightning.js';
 import { MemoryKV, KEYS } from '../src/store.js';
 import { parseLedger, type LedgerRow, type RepoRef, type RowKind } from '../src/tbuv-ledger.js';
 import { lightningDecision, lightningPresentAsk, lightningVoteAsk } from '../src/prompts.js';
@@ -59,8 +59,9 @@ function fakeGit(files: Record<string, string> = { 'src/session.ts': SESSION_TS 
   const ok = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
   const fail = (): RunResult => ({ code: 128, stdout: '', stderr: 'fatal: not found' });
   const run: Runner = async (cmd, args) => {
-    calls.push({ cmd, args });
     const [dashC, , sub, ...rest] = args;
+    if (cmd === 'git' && dashC === '-C' && sub === 'rev-parse' && rest[0] === '--show-prefix') return ok(`\n${args[1]}\n`); // where the checkout sits in its repo: its top, and not a call about a cite
+    calls.push({ cmd, args });
     if (cmd !== 'git' || dashC !== '-C') throw new Error(`unexpected invocation: ${cmd} ${args.join(' ')}`);
     if (sub === 'rev-parse') {
       const name = rest[2].slice(0, -'^{commit}'.length);
@@ -291,6 +292,7 @@ describe('the view', () => {
       row: { key: 'uv:shop-app:UV-0036', id: 'UV-0036', kind: 'unverified', repo: 'shop-app', repoPath: '/work/shop-app', date: '2026-10-12', claim: 'offline uploads reuse the session id minted online', doubt: 'never checked against a cold start', status: 'open', open: true },
       phase: 'queued',
       presentation: null,
+      rev: 0,
       votes: { asked: false, tally: { concur: 0, concern: 0, refuted: 0, silent: 0, asked: 0 }, entries: [] },
       decision: null,
     });
@@ -419,6 +421,36 @@ describe('presenting: the winning block', () => {
     const argv = h.git.calls.flatMap((c) => c.args).join('\n');
     for (const bad of ['passwd', '-x/y', '--output', 'trust me']) expect(argv).not.toContain(bad);
     expect(h.git.calls.length).toBe(4); // only the one parseable cite was checked
+  });
+
+  it('a reply with pipes in its title, claim and assessment is a presentation, not "replied without a usable block"', async () => {
+    const h = harness();
+    const a = agent('A');
+    h.roster.push(a);
+    const free = { title: 'getUser returns string | undefined', claim: 'the guard is `a || b`', assessment: '`cat x | grep y` is empty, so a || b is always true.' };
+    h.onAsk.set(a.sessionID, () => block('UV-0036', free));
+    const r = round([rowOf('UV-0036')], h);
+    r.start();
+    await r.settle();
+    expect(r.view().items[0].phase).toBe('presented');
+    expect(r.view().items[0].presentation).toMatchObject({ source: 'agent', ...free });
+    expect(r.view().log).toStrictEqual([]);
+  });
+
+  it('the cite field decides the grounding: bracketed, hashed and ranged cites count, prose with digits in it does not', async () => {
+    const h = harness();
+    const a = agent('A');
+    h.roster.push(a);
+    h.onAsk.set(a.sessionID, () =>
+      block('UV-0036', {
+        options: ['A | confirm | bracketed | [1] | x', 'B | deny | hashed | #1 | x', 'C | challenge | a range | 1-2 | x', 'D | no_change | prose | none (checked 1 file) | x'],
+      })
+    );
+    const r = round([rowOf('UV-0036')], h);
+    r.start();
+    await r.settle();
+    const options = r.view().items[0].presentation?.options ?? [];
+    expect(options.map((o) => `${o.letter}:${o.cites.join(',')}:${o.grounding}`)).toStrictEqual(['A:1:grounded', 'B:1:grounded', 'C:1,2:grounded', 'D::ungrounded']);
   });
 
   it('a runner that throws makes the cite ungrounded with the error, and the card still shows', async () => {
@@ -771,6 +803,110 @@ describe('presenting: several asks at once', () => {
     r.start();
     await r.settle();
     expect(r.view().log).toStrictEqual(['agent-A A0000000 did not reply within 10s.', 'No presentation for uv:shop-app:UV-0036: The present call timed out. Showing the ledger row.']);
+  });
+
+  it.each([false, true])('one text that answers both asks presents both rows, whichever block comes first (reversed: %s)', async (reversed) => {
+    const h = harness({ maxPresenters: 1 });
+    const a = agent('A');
+    h.roster.push(a);
+    const [one, two] = [block('UV-0001', { title: 'the first row' }), block('UV-0002', { title: 'the second row' })];
+    h.at(1, () => h.reply(a.sessionID, `${reversed ? two : one}\n\nAnd the other one:\n\n${reversed ? one : two}`));
+    const r = round([rowOf('UV-0001'), rowOf('UV-0002')], h);
+    r.start();
+    await r.settle();
+    const v = r.view();
+    expect(phases(v)).toStrictEqual(['UV-0001:presented', 'UV-0002:presented']);
+    expect(v.items.map((i) => i.presentation?.title)).toStrictEqual(['the first row', 'the second row']);
+    expect(v.log).toStrictEqual([]);
+    expect(h.now() - T0).toBeLessThan(10_000); // read at the first poll: nobody waited for a timeout
+  });
+
+  it('in a text with several blocks, an unusable block for this row is this row’s failure and one for another row is not', async () => {
+    const h = harness({ maxPresenters: 1 });
+    const a = agent('A');
+    h.roster.push(a);
+    h.at(1, () => h.reply(a.sessionID, `${unusable('UV-0002')}\n\n${block('UV-0001', { title: 'the first row' })}`));
+    const r = round([rowOf('UV-0001'), rowOf('UV-0002')], h);
+    r.start();
+    await r.settle();
+    const v = r.view();
+    expect(phases(v)).toStrictEqual(['UV-0001:presented', 'UV-0002:fallback']);
+    expect(v.log).toStrictEqual(['agent-A A0000000 replied without a usable block.', 'No presentation for uv:shop-app:UV-0002: Nobody replied with a usable block. Showing the ledger row.']);
+  });
+
+  it('a text whose blocks are all for other rows is not an answer: the wait goes on to the timeout', async () => {
+    const h = harness({ presentTimeoutMs: 10_000 });
+    const a = agent('A');
+    h.roster.push(a);
+    h.onAsk.set(a.sessionID, () => `${block('UV-9998')}\n\n${block('UV-9999')}`);
+    const r = round([rowOf('UV-0036')], h);
+    r.start();
+    await r.settle();
+    expect(r.view().log).toStrictEqual(['agent-A A0000000 did not reply within 10s.', 'No presentation for uv:shop-app:UV-0036: The present call timed out. Showing the ledger row.']);
+  });
+
+  it('the ask names the repo, and a reply that names another repo is not this row’s: the same id in two repos is two rows', async () => {
+    const h = harness({ presentTimeoutMs: 10_000 });
+    const a = agent('A');
+    h.roster.push(a);
+    const withRepo = (repo: string) => block('UV-0001').replace('id: UV-0001', `id: UV-0001\nrepo: ${repo}`);
+    h.onAsk.set(a.sessionID, () => withRepo('billing'));
+    const r = round([rowOf('UV-0001')], h);
+    r.start();
+    await r.settle();
+    expect(h.sent[0].text).toContain('```cim-lightning\nid: UV-0001\nrepo: shop-app\n');
+    expect(r.view().items[0].phase).toBe('fallback');
+    expect(r.view().log[0]).toBe('agent-A A0000000 did not reply within 10s.');
+
+    for (const [repo, reply] of [
+      ['the right repo', withRepo('Shop-App')],
+      ['no repo line', block('UV-0001')],
+    ] as const) {
+      const g = harness();
+      const b = agent('A');
+      g.roster.push(b);
+      g.onAsk.set(b.sessionID, () => reply);
+      const q = round([rowOf('UV-0001')], g);
+      q.start();
+      await q.settle();
+      expect([repo, q.view().items[0].phase]).toStrictEqual([repo, 'presented']);
+    }
+  });
+
+  it('never has one agent out on two asks for rows with the same id: the second row is not asked of it, and does not adopt the first row’s card', async () => {
+    const h = harness();
+    const a = agent('A');
+    h.roster.push(a);
+    h.answerAll(a);
+    // a tombstone and an unverified claim of one repo can share an id; so can a numeric id
+    const rows = [rowOf('UV-0009', { claim: 'the tombstone' }, REPO, 'tombstone'), rowOf('UV-0009', { claim: 'the unverified claim' }, REPO, 'unverified')];
+    const r = round(rows, h);
+    r.start();
+    await r.settle();
+    const v = r.view();
+    expect(h.sent.map((s) => kindOfSent(s.text))).toStrictEqual(['ask']); // one ask, for the first row
+    expect(item(v, rows[0].key)).toMatchObject({ phase: 'presented', presentation: { source: 'agent', presentedBy: 'agent-A' } });
+    expect(item(v, rows[1].key)).toMatchObject({ phase: 'fallback', presentation: { source: 'ledger' } });
+    expect(v.log).toStrictEqual([]); // not a candidate, and nothing to say about it
+    // once the agent has answered it is free: the second row, rejected, is asked of it
+    await r.approve(rows[0].key, 'C');
+    r.reject(rows[1].key);
+    await r.settle();
+    expect(h.sent.map((s) => kindOfSent(s.text))).toStrictEqual(['ask', 'ask']);
+    expect(item(r.view(), rows[1].key)).toMatchObject({ phase: 'presented', presentation: { source: 'agent' } });
+  });
+
+  it('a reply of 200k characters with a whitespace-heavy id line is read in no time', async () => {
+    const h = harness({ presentTimeoutMs: 4_000 });
+    const a = agent('A');
+    h.roster.push(a);
+    h.onAsk.set(a.sessionID, () => '```cim-lightning\nid: a' + ' '.repeat(200_000) + 'b\nclaim: x\n```');
+    const r = round([rowOf('UV-0036')], h);
+    const started = performance.now();
+    r.start();
+    await r.settle();
+    expect(performance.now() - started).toBeLessThan(3000); // the lazy regex needed about a minute for it
+    expect(r.view().log).toStrictEqual(['agent-A A0000000 did not reply within 4s.', 'No presentation for uv:shop-app:UV-0036: The present call timed out. Showing the ledger row.']); // the block names another row
   });
 
   it('prefetch decides how many further rows are asked at once, and the window moves as rows are settled', async () => {
@@ -1358,12 +1494,27 @@ describe('asking skeptics', () => {
     expect(r.view().log).toStrictEqual(['agent-S2 S2000000 did not take the vote ask: refused']);
   });
 
-  it('with nobody else to ask it is asked, empty, and says why', async () => {
-    const h = harness();
+  it('with nobody else to ask it says why and is not marked asked, so the human can try again', async () => {
+    const h = harness({ voteTimeoutMs: 10_000 });
     const { r, key } = await withPanel(h, ['P']);
     await r.askSkeptics(key);
-    expect(item(r.view(), key).votes).toStrictEqual({ asked: true, tally: { concur: 0, concern: 0, refuted: 0, silent: 0, asked: 0 }, entries: [] });
+    expect(item(r.view(), key).votes).toStrictEqual({ asked: false, tally: { concur: 0, concern: 0, refuted: 0, silent: 0, asked: 0 }, entries: [] });
     expect(r.view().log).toStrictEqual(['No other agent can be messaged to vote on uv:shop-app:UV-0036.']);
+    expect(votesSent(h)).toStrictEqual([]);
+    // somebody arrives: the second try asks them
+    const s1 = agent('S1');
+    h.roster.push(s1);
+    await r.askSkeptics(key);
+    expect(votesSent(h)).toStrictEqual(['S1']);
+    expect(item(r.view(), key).votes).toMatchObject({ asked: true, tally: { asked: 1, silent: 1 } });
+    expect(r.view().log).toStrictEqual(['No other agent can be messaged to vote on uv:shop-app:UV-0036.']);
+  });
+
+  it('a panel size of zero asks nobody and leaves the card unasked', async () => {
+    const h = harness();
+    const { r, key } = await withPanel(h, ['P', 'S1'], { panelSize: 0 });
+    await r.askSkeptics(key);
+    expect(item(r.view(), key).votes.asked).toBe(false);
     expect(votesSent(h)).toStrictEqual([]);
   });
 
@@ -1413,6 +1564,124 @@ describe('asking skeptics', () => {
     h.reply(byName('S2').sessionID, vote('UV-0036', 'refuted'));
     await r.settle(); // the row is presented again, by the agents that did not reject it
     expect(item(r.view(), key).votes).toStrictEqual(cleared);
+  });
+
+  it('one text that votes on two cards counts for each card by its own id', async () => {
+    const h = harness({ voteTimeoutMs: 10_000 });
+    const [p, s1] = [agent('P'), agent('S1')];
+    h.roster.push(p, s1);
+    h.answerAll(p);
+    const rows = [rowOf('UV-0001'), rowOf('UV-0002')];
+    const r = round(rows, h);
+    r.start();
+    await r.settle();
+    await r.askSkeptics(rows[0].key);
+    await r.askSkeptics(rows[1].key);
+    h.reply(s1.sessionID, `${vote('UV-0002', 'concur')}\n\nand the other:\n\n${vote('UV-0001', 'refuted')}`);
+    await r.settle();
+    const v = r.view();
+    expect(item(v, rows[0].key).votes.entries.map((e) => [e.name, e.vote])).toStrictEqual([['agent-S1', 'refuted']]);
+    expect(item(v, rows[1].key).votes.entries.map((e) => [e.name, e.vote])).toStrictEqual([['agent-S1', 'concur']]);
+  });
+
+  it('a reply is about the card it names: the same id in two repos does not give one skeptic’s vote to both cards', async () => {
+    const h = harness({ voteTimeoutMs: 10_000 });
+    const [p, q, s1] = [agent('P'), agent('Q', { cwd: '/work/billing' }), agent('S1')]; // P presents shop-app, Q presents billing, S1 is spare
+    h.roster.push(p, q, s1);
+    h.answerAll(p, q);
+    const rows = [rowOf('UV-0001'), rowOf('UV-0001', { claim: 'the claim of the billing row' }, BILLING)];
+    const r = round(rows, h, { panelSize: 2 });
+    r.start();
+    await r.settle();
+    expect(rows.map((x) => item(r.view(), x.key).presentation?.presentedBy)).toStrictEqual(['agent-P', 'agent-Q']);
+    await r.askSkeptics(rows[0].key);
+    await r.askSkeptics(rows[1].key);
+    // S1 is on the shop-app panel and has not answered: it is not asked about the billing row as well
+    expect(h.sent.filter((x) => kindOfSent(x.text) === 'vote').map((x) => x.to.slice(0, 2))).toStrictEqual(['S1', 'Q0', 'P0']);
+    expect(item(r.view(), rows[1].key).votes.entries.map((e) => e.name)).toStrictEqual(['agent-P']);
+    // its one reply, about the shop-app card, is the shop-app card's alone
+    h.reply(s1.sessionID, vote('UV-0001', 'refuted'));
+    await ticks(8);
+    expect(item(r.view(), rows[0].key).votes.entries.map((e) => [e.name, e.vote])).toStrictEqual([['agent-S1', 'refuted'], ['agent-Q', null]]);
+    expect(item(r.view(), rows[1].key).votes.entries.map((e) => [e.name, e.vote])).toStrictEqual([['agent-P', null]]);
+    expect(item(r.view(), rows[1].key).votes.tally).toMatchObject({ refuted: 0, silent: 1 });
+  });
+
+  it('having answered, a skeptic can be asked about the other row with the same id, and its answer there is that card’s', async () => {
+    const h = harness({ voteTimeoutMs: 10_000 });
+    const [p, q, s1] = [agent('P'), agent('Q', { cwd: '/work/billing' }), agent('S1')];
+    h.roster.push(p, q, s1);
+    h.answerAll(p, q);
+    const rows = [rowOf('UV-0001'), rowOf('UV-0001', { claim: 'the claim of the billing row' }, BILLING)];
+    const r = round(rows, h, { panelSize: 2 });
+    r.start();
+    await r.settle();
+    await r.askSkeptics(rows[0].key);
+    h.reply(s1.sessionID, vote('UV-0001', 'refuted'));
+    await ticks(8);
+    expect(item(r.view(), rows[0].key).votes.entries[0]).toMatchObject({ name: 'agent-S1', vote: 'refuted' });
+    await r.askSkeptics(rows[1].key); // S1 has answered: it is free, and the roster order puts it after P
+    expect(item(r.view(), rows[1].key).votes.entries.map((e) => e.name)).toStrictEqual(['agent-P', 'agent-S1']);
+    h.reply(s1.sessionID, ['```cim-vote', 'id: UV-0001', 'repo: billing', 'vote: concur', '```'].join('\n'));
+    await ticks(8);
+    expect(item(r.view(), rows[1].key).votes.entries.map((e) => [e.name, e.vote])).toStrictEqual([['agent-P', null], ['agent-S1', 'concur']]);
+    expect(item(r.view(), rows[0].key).votes.entries.map((e) => [e.name, e.vote])).toStrictEqual([['agent-S1', 'refuted'], ['agent-Q', null]]);
+  });
+
+  it('a vote that names another repo is not this card’s', async () => {
+    const h = harness({ voteTimeoutMs: 10_000 });
+    const { r, key, byName } = await withPanel(h, ['P', 'S1']);
+    await r.askSkeptics(key);
+    expect(h.sent.at(-1)?.text).toContain('```cim-vote\nid: UV-0036\nrepo: shop-app\n');
+    h.reply(byName('S1').sessionID, ['```cim-vote', 'id: UV-0036', 'repo: billing', 'vote: refuted', '```'].join('\n'));
+    await ticks(6);
+    expect(item(r.view(), key).votes.tally).toMatchObject({ refuted: 0, silent: 1 });
+    h.reply(byName('S1').sessionID, ['```cim-vote', 'id: UV-0036', 'repo: shop-app', 'vote: concur', 'reason: A | B both fail', '```'].join('\n'));
+    await ticks(6);
+    expect(item(r.view(), key).votes.entries[0]).toMatchObject({ vote: 'concur', reason: 'A | B both fail' });
+  });
+
+  it('a transcript that cannot be read is said once per agent, and that agent stays silent in the tally', async () => {
+    const h = harness({ voteTimeoutMs: 10_000 });
+    const { r, key, byName } = await withPanel(h, ['P', 'S1', 'S2', 'S3']);
+    const read = h.deps.readSince;
+    h.deps.readSince = async (a, offset) => {
+      if (a.name === 'agent-S1' || a.name === 'agent-S2') throw new Error('EIO: i/o error');
+      return read(a, offset);
+    };
+    await r.askSkeptics(key);
+    h.reply(byName('S3').sessionID, vote('UV-0036', 'concur'));
+    await r.settle();
+    const v = item(r.view(), key);
+    expect(r.view().log).toStrictEqual([
+      'agent-S1 S1000000 transcript could not be read: EIO: i/o error',
+      'agent-S2 S2000000 transcript could not be read: EIO: i/o error',
+      '2 of 3 did not vote on uv:shop-app:UV-0036 within 10s. A late vote still counts.',
+    ]);
+    expect(v.votes.tally).toStrictEqual({ concur: 1, concern: 0, refuted: 0, silent: 2, asked: 3 });
+  });
+
+  it('a card that is deferred, decided or aborted while the transcript sizes are being read is not sent the vote ask', async () => {
+    for (const leave of ['defer', 'abort', 'approve'] as const) {
+      const h = harness({ voteTimeoutMs: 10_000 });
+      const { r, key } = await withPanel(h, ['P', 'S1', 'S2']);
+      let release!: () => void;
+      const gate = new Promise<void>((res) => (release = res));
+      const size = h.deps.transcriptSize;
+      h.deps.transcriptSize = async (a) => {
+        await gate;
+        return size(a);
+      };
+      const asking = r.askSkeptics(key);
+      await ticks(3);
+      if (leave === 'defer') r.defer(key);
+      else if (leave === 'abort') r.abort();
+      else await r.approve(key, 'C');
+      release();
+      await asking;
+      await r.settle();
+      expect([leave, votesSent(h)]).toStrictEqual([leave, []]);
+    }
   });
 });
 
@@ -1513,6 +1782,62 @@ describe('abort', () => {
     expect(item(r.view(), row.key).votes.tally.silent).toBe(1);
   });
 
+  it('after abort, asking skeptics sends nothing and says once that the round was stopped', async () => {
+    const h = harness({ voteTimeoutMs: 10_000 });
+    const [p, s1] = [agent('P'), agent('S1')];
+    h.roster.push(p, s1);
+    h.onAsk.set(p.sessionID, () => block('UV-0036'));
+    const row = rowOf('UV-0036');
+    const r = round([row], h);
+    r.start();
+    await r.settle();
+    expect(r.view().items[0].phase).toBe('presented');
+    r.abort();
+    const before = { sent: h.sent.length, sleeps: h.sleeps(), reads: h.reads() };
+    await r.askSkeptics(row.key);
+    await r.askSkeptics(row.key);
+    await r.settle();
+    expect(h.sent).toHaveLength(before.sent);
+    expect({ sleeps: h.sleeps(), reads: h.reads() }).toStrictEqual({ sleeps: before.sleeps, reads: before.reads });
+    expect(r.view().log).toStrictEqual(['This round was stopped.']);
+    expect(r.view().items[0]).toMatchObject({ phase: 'presented', votes: { asked: false, entries: [] } });
+  });
+
+  it('after abort, reject does nothing: the card keeps its presentation and nothing is queued again', async () => {
+    const h = harness();
+    const rows = [rowOf('UV-0001'), rowOf('UV-0002')];
+    const { r } = await presented(rows, h);
+    r.abort();
+    const before = r.view();
+    r.reject(rows[0].key);
+    await r.settle();
+    expect(r.view()).toStrictEqual(before);
+    expect(item(r.view(), rows[0].key)).toMatchObject({ phase: 'presented', presentation: { source: 'agent' } });
+    expect(r.view().items.map((i) => i.id)).toStrictEqual(['UV-0001', 'UV-0002']);
+  });
+
+  it.each(['defer', 'abort'] as const)('a card that is put off with %s while the transcript size is being read is not sent the ask', async (leave) => {
+    const h = harness();
+    h.roster.push(agent('A'));
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    const size = h.deps.transcriptSize;
+    h.deps.transcriptSize = async (a) => {
+      await gate;
+      return size(a);
+    };
+    const row = rowOf('UV-0001');
+    const r = round([row], h);
+    r.start();
+    await ticks(3);
+    expect(r.view().items[0].phase).toBe('presenting');
+    if (leave === 'defer') r.defer(row.key);
+    else r.abort();
+    release();
+    await r.settle();
+    expect(h.sent).toStrictEqual([]);
+  });
+
   it('leaves the decisions already recorded', async () => {
     const h = harness();
     const rows = [rowOf('UV-0001'), rowOf('UV-0002')];
@@ -1534,6 +1859,126 @@ describe('abort', () => {
     await r.settle();
     expect(h.sent).toStrictEqual([]);
     expect(r.view().active).toBe(false);
+  });
+});
+
+// ---- the identity of a card -----------------------------------------------------------------------------------------
+
+describe('a card’s rev', () => {
+  const key = 'uv:shop-app:UV-0001';
+
+  it('goes up whenever the presentation is set, replaced or dropped', async () => {
+    const h = harness({ maxPresenters: 1 });
+    const [a, b] = [agent('A'), agent('B')];
+    h.roster.push(a, b);
+    h.answerAll(a, b);
+    const r = round([rowOf('UV-0001')], h, { prefetch: 0 });
+    const revs: number[] = [r.view().items[0].rev];
+    expect(revs).toStrictEqual([0]);
+    r.start();
+    await r.settle();
+    revs.push(r.view().items[0].rev); // presented by A
+    r.reject(key);
+    revs.push(r.view().items[0].rev); // dropped
+    await r.settle();
+    revs.push(r.view().items[0].rev); // presented again, by B
+    expect(r.view().items[0].presentation?.presentedBy).toBe('agent-B');
+    expect(revs).toStrictEqual([0, 1, 2, 3]);
+    r.reject(key); // everyone has rejected it: the ledger row is shown, which is another card
+    expect(r.view().items[0]).toMatchObject({ phase: 'fallback', rev: 5 });
+    await r.approve(key, 'C');
+    expect(r.view().items[0].rev).toBe(5); // deciding does not change the card
+  });
+
+  it('a fallback card has a rev of its own', () => {
+    const h = harness();
+    const r = round([rowOf('UV-0001')], h);
+    r.start();
+    expect(r.view().items[0]).toMatchObject({ phase: 'fallback', rev: 1 });
+  });
+
+  it('approve with the rev of an older card throws StaleCardError and sends nothing, after a reject and a new presenter', async () => {
+    const h = harness({ maxPresenters: 1 });
+    const [a, b] = [agent('A'), agent('B')];
+    h.roster.push(a, b);
+    const options = (verb: string) => [`A | ${verb} | Option A | 1 | x`, 'B | no_change | Leave it | | x'];
+    h.onAsk.set(a.sessionID, (text) => block(idIn(text), { options: options('confirm') }));
+    h.onAsk.set(b.sessionID, (text) => block(idIn(text), { options: options('deny') }));
+    const r = round([rowOf('UV-0001')], h, { prefetch: 0 });
+    r.start();
+    await r.settle();
+    const seen = r.view().items[0];
+    expect(seen.presentation?.options[0].verb).toBe('confirm');
+    r.reject(key);
+    await r.settle();
+    const now = r.view().items[0];
+    expect(now.presentation?.options[0].verb).toBe('deny');
+    expect(now.rev).toBeGreaterThan(seen.rev);
+    const sentBefore = h.sent.length;
+    await expect(r.approve(key, 'A', seen.rev)).rejects.toThrow(new StaleCardError(key));
+    await expect(r.approve(key, 'A', seen.rev)).rejects.toThrow('The card for uv:shop-app:UV-0001 changed; look again.');
+    await expect(r.approve(key, 'A', seen.rev)).rejects.toBeInstanceOf(StaleCardError);
+    await expect(r.approve(key, 'A', now.rev - 1)).rejects.toBeInstanceOf(StaleCardError);
+    expect(h.sent).toHaveLength(sentBefore);
+    expect(r.view().items[0]).toMatchObject({ phase: 'presented', decision: null });
+    expect(h.kv.get(KEYS.lightning)).toBeUndefined();
+    // the current rev goes through, and so does a call that names none
+    expect(await r.approve(key, 'A', now.rev)).toStrictEqual({ delivered: true, decided: true });
+    expect(h.sent.at(-1)?.to).toBe(b.sessionID);
+  });
+
+  it('without a rev, approve behaves as it did; the key and the letter are still checked', async () => {
+    const h = harness();
+    const { r } = await presented([rowOf('UV-0001'), rowOf('UV-0002')], h);
+    await expect(r.approve('nope', 'A', 1)).rejects.toThrow(new Error('No lightning item nope.'));
+    expect(await r.approve(key, 'A')).toStrictEqual({ delivered: true, decided: true });
+    // a decided card whose rev the caller still holds: the repeat is a no-op, not an error
+    const rev = r.view().items[0].rev;
+    expect(await r.approve(key, 'A', rev)).toStrictEqual({ delivered: false, decided: true });
+    await expect(r.approve('uv:shop-app:UV-0002', 'D', r.view().items[1].rev)).rejects.toThrow(new Error('Option D is not offered for uv:shop-app:UV-0002.'));
+  });
+});
+
+// ---- notes from outside -----------------------------------------------------------------------------------------------
+
+describe('note', () => {
+  it('adds a line to the log of a round that has no items and fires onChange', () => {
+    const seen: string[][] = [];
+    const h = harness({ onChange: (x) => seen.push(x.view().log) });
+    const r = round([], h);
+    r.note('Could not read the ledger of shop-app: git unavailable');
+    expect(r.view().log).toStrictEqual(['Could not read the ledger of shop-app: git unavailable']);
+    expect(seen).toStrictEqual([['Could not read the ledger of shop-app: git unavailable']]);
+    r.start();
+    r.note('second');
+    expect(r.view().log).toStrictEqual(['Could not read the ledger of shop-app: git unavailable', 'second']);
+  });
+
+  it('shares the log with the engine’s own lines, oldest first, bounded to the last 20, and works after an abort', async () => {
+    const h = harness();
+    const row = rowOf('UV-0001');
+    const r = round([row], h);
+    r.start(); // nobody to ask: "No presentation for …"
+    for (let i = 1; i <= 25; i++) r.note(`line ${i}`);
+    const log = r.view().log;
+    expect(log).toHaveLength(20);
+    expect(log[0]).toBe('line 6');
+    expect(log[19]).toBe('line 25');
+    r.abort();
+    r.note('after the abort');
+    expect(r.view().log.at(-1)).toBe('after the abort');
+    expect(r.view().log).toHaveLength(20);
+  });
+
+  it('a listener that throws does not break it', () => {
+    const h = harness({
+      onChange: () => {
+        throw new Error('listener bug');
+      },
+    });
+    const r = round([], h);
+    expect(() => r.note('still here')).not.toThrow();
+    expect(r.view().log).toStrictEqual(['still here']);
   });
 });
 

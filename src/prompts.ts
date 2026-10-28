@@ -148,10 +148,11 @@ export interface DecisionOption {
   why: string;
 }
 
-/** Untrusted text as one line: every run of whitespace or control characters becomes one space, backtick fences are defused, and it is cut to `max` characters with an ellipsis. */
+/** Untrusted text as one line: invisible format characters (zero-width, bidi controls, the U+E0000 tag block) are dropped, every run of whitespace (U+2028 and U+2029 too) or control characters becomes one space, backtick fences are defused, and it is cut to `max` characters with an ellipsis. */
 export function quoted(text: string, max = 600): string {
   if (max < 1) return '';
   const flat = text
+    .replace(/[\p{Cf}\u{E0000}-\u{E007F}]/gu, '')
     .replace(/[\s\p{Cc}]+/gu, ' ')
     .replace(/`{3,}/g, (run) => "'".repeat(run.length))
     .trim();
@@ -180,9 +181,10 @@ const rowLines = (row: PromptRow): string[] => [
   `- settles_it: ${datum(row.settlesIt)}`,
 ];
 
-const lightningTemplate = (id: string): string[] => [
+const lightningTemplate = (row: PromptRow): string[] => [
   '```' + LIGHTNING_FENCE,
-  `id: ${quoted(id, 80)}`,
+  `id: ${quoted(row.id, 80)}`,
+  `repo: ${quoted(row.repo, 120)}`,
   'needs: human | agent | none',
   'nature: decision | fact | measurement',
   'checkable: now | later | never',
@@ -198,9 +200,10 @@ const lightningTemplate = (id: string): string[] => [
   '```',
 ];
 
-const voteTemplate = (id: string): string[] => [
+const voteTemplate = (row: PromptRow): string[] => [
   '```' + VOTE_FENCE,
-  `id: ${quoted(id, 80)}`,
+  `id: ${quoted(row.id, 80)}`,
+  `repo: ${quoted(row.repo, 120)}`,
   'vote: concur | concern | refuted',
   'prefers: A | B | C | D | none',
   'reason: <one sentence>',
@@ -222,7 +225,7 @@ export const lightningPresentAsk = (row: PromptRow): string =>
       'needs is who has to act next, nature is what kind of question this is, checkable is whether it can be checked now. Keep each value on one line. ' +
       'Reply only in this fenced block and nothing else:',
     '',
-    ...lightningTemplate(row.id),
+    ...lightningTemplate(row),
     '',
     'Only answer for now: don’t start on the row’s follow-up work, and carry on with whatever you were doing.',
   ].join('\n');
@@ -251,7 +254,7 @@ export const lightningVoteAsk = (row: PromptRow, presentation: PromptPresentatio
       'and refuted if it is wrong. prefers is the option you would pick, or none. Judge from what you already know and what you can see quickly in your own working directory; change no file. ' +
       'Reply only in this fenced block and nothing else:',
     '',
-    ...voteTemplate(row.id),
+    ...voteTemplate(row),
     '',
     'Only vote for now: don’t start on the row’s follow-up work, and carry on with whatever you were doing.',
   ].join('\n');
@@ -262,7 +265,7 @@ const DECISION_ACTION: Record<DecisionOption['verb'], Record<PromptRow['kind'], 
     unverified:
       'The human has settled this unverified claim as confirmed. Update the unverified ledger (unverified.jsonl) the way you normally do: mark the claim confirmed and record the evidence you cited for it, so the row is no longer open.',
     tombstone:
-      'The human has confirmed this tombstone. It stands: in the tombstone ledger (tombstones.jsonl), mark the row verified the way you normally do, and record the evidence you cited for it.',
+      'The human has confirmed this tombstone. It stands: in the tombstone ledger (tombstones.jsonl), set the row’s `status` to `confirmed` the way you normally do, and record the evidence you cited for it.',
   },
   deny: {
     unverified:
@@ -284,9 +287,9 @@ export function lightningDecision(row: PromptRow, option: DecisionOption, presen
   const action = DECISION_ACTION[option.verb]?.[row.kind];
   if (action === undefined) throw new Error(`No decision text for verb ${datum(String(option.verb), 20)} on a ${datum(String(row.kind), 20)} row.`);
   return [
-    `[cIM Lightning Round] A human approved option ${quoted(option.letter, 8)} for ${quoted(row.id, 80)}.`,
+    `[cIM Lightning Round] A human approved option ${quoted(option.letter, 8)} for this row.`,
     [
-      `- row: ${quoted(row.id, 80)}, ${kindWords(row.kind)}, repo ${datum(row.repo, 120)}`,
+      `- row: ${datum(row.id, 80)}, ${kindWords(row.kind)}, repo ${datum(row.repo, 120)}`,
       `- claim: ${datum(row.claim || presentation.claim)}`,
       `- option ${quoted(option.letter, 8)} (${quoted(option.verb, 16)}): ${datum(option.title, 200)}`,
       `- rationale: ${datum(option.why)}`,
